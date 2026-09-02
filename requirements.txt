@@ -1,0 +1,6 @@
+streamlit>=1.30.0
+geopandas>=0.14.0
+folium>=0.15.0
+streamlit-folium>=0.17.0
+shapely>=2.0.0
+pyproj>=3.0.0

@@ -1,0 +1,9 @@
+{
+"type": "FeatureCollection",
+"name": "rios_neuquen",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{ "type": "Feature", "properties": { "gid": 866123, "entidad": 6.0, "objeto": "Muro de embalse", "fna": "Embalse Piedra del Águila", "gna": "Embalse", "nam": "Piedra del Águila", "fdc": "/ECyT-ar/IGN01", "sag": "IGN" }, "geometry": { "type": "LineString", "coordinates": [ [ -69.991787517999967, -40.190481661999968 ], [ -69.991127365999944, -40.190420176999964 ], [ -69.989318975999936, -40.190315480999971 ], [ -69.987910334999981, -40.190201266999964 ], [ -69.987339263999957, -40.190020427999968 ] ] } },
+{ "type": "Feature", "properties": { "gid": 878529, "entidad": 6.0, "objeto": "Muro de embalse", "fna": "Dique Piedra del Águila", "gna": "Dique", "nam": "Piedra del Águila", "fdc": "/ECyT-ar/IGN01", "sag": "IGN" }, "geometry": { "type": "LineString", "coordinates": [ [ -69.996600125999976, -40.190258373999939 ], [ -69.995629305999955, -40.190515355999935 ], [ -69.994230182999956, -40.19069619499993 ], [ -69.993069005999985, -40.19060101599996 ], [ -69.991787517999967, -40.190481661999968 ] ] } }
+]
+}
