@@ -10,34 +10,26 @@ poligonos_nqn = []
 lineas_nqn = []
 puntos_nqn = []
 
-# Palabras clave amplias para atrapar todo lo de la cuenca y la provincia de Neuquén
-patron_nqn = (
-    "Limay|Neuquén|Negro|Traful|Aluminé|Lácar|Malleo|Ñorquín|Agrio|Chos"
-    " Malal|Cipolletti|Ramos Mexia|Alicurá|Piedra del Águila|Nahuel"
-    " Huapi|Colón|Collón Curá|Gnecco|Urrutia"
-)
+# Límite geográfico estricto para la región de Neuquén / Cuenca
+MIN_LON, MAX_LON = -72.5, -67.0
+MIN_LAT, MAX_LAT = -41.5, -35.5
 
 for ruta in todos_los_shps:
   print(f"Leyendo: {ruta}")
   try:
     gdf = gpd.read_file(ruta)
 
-    # Buscar columna de nombre disponible
-    col_nombre = next(
-        (c for c in ["nam", "NAM", "FNA", "fna", "TLA"] if c in gdf.columns), None
-    )
+    if gdf.empty:
+      continue
 
-    if col_nombre:
-      # Filtrar por la región
-      filtrado = gdf[
-          gdf[col_nombre].str.contains(patron_nqn, na=False, case=False)
-      ]
-    else:
-      # Si no tiene nombre, la dejamos pasar o la omitimos (las del IGN casi siempre tienen)
-      filtrado = gdf.head(0)
+    # Reproyectar a EPSG:4326 para filtro espacial en grados
+    if gdf.crs is not None and gdf.crs.to_string() != "EPSG:4326":
+      gdf = gdf.to_crs(epsg=4326)
+
+    # Filtro espacial directo por la región de la cuenca (sin restringir por texto)
+    filtrado = gdf.cx[MIN_LON:MAX_LON, MIN_LAT:MAX_LAT].copy()
 
     if not filtrado.empty:
-      # Clasificar según el tipo de geometría principal
       geom_tipo = filtrado.geom_type.iloc[0]
       if "Polygon" in geom_tipo:
         poligonos_nqn.append(filtrado)
@@ -54,6 +46,8 @@ print("\nConsolidando y exportando resultados...")
 
 if poligonos_nqn:
   final_polys = pd.concat(poligonos_nqn, ignore_index=True)
+  if "gid" in final_polys.columns:
+    final_polys = final_polys.drop_duplicates(subset=["gid"])
   final_polys.to_file("cuerpos_agua_neuquen.geojson", driver="GeoJSON")
   print(
       f"-> Guardados {len(final_polys)} polígonos en"

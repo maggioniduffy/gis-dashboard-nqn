@@ -15,6 +15,7 @@ def create_cuenca_map(
     gdf_cuenca: gpd.GeoDataFrame | None,
     gdf_rios: gpd.GeoDataFrame | None = None,
     gdf_lagos: gpd.GeoDataFrame | None = None,
+    gdf_puntos: gpd.GeoDataFrame | None = None,
     controls: dict = None
 ) -> folium.Map:
     """
@@ -108,6 +109,24 @@ def create_cuenca_map(
             },
             tooltip=folium.GeoJsonTooltip(fields=['nam'] if 'nam' in gdf_rios.columns else None)
         ).add_to(m)
+
+    # 3b. Capa de Puntos de Interés IGN
+    if gdf_puntos is not None and not gdf_puntos.empty:
+        puntos_group = folium.FeatureGroup(name="Puntos Hidrológicos IGN")
+        for idx, row in gdf_puntos.iterrows():
+            if row.geometry and row.geometry.geom_type == 'Point':
+                name = row.get('nam') or row.get('fna') or 'Punto IGN'
+                folium.CircleMarker(
+                    location=[row.geometry.y, row.geometry.x],
+                    radius=6,
+                    color="#ffb703",
+                    fill=True,
+                    fill_color="#fb8500",
+                    fill_opacity=0.9,
+                    tooltip=name,
+                    popup=folium.Popup(f"<b>Punto IGN:</b> {name}", max_width=200)
+                ).add_to(puntos_group)
+        puntos_group.add_to(m)
 
     # 4. Capa de Estaciones Meteorológicas
     if controls.get("show_stations", True):

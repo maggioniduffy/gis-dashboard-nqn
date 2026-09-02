@@ -57,16 +57,17 @@ def main():
     )
 
     # Carga de datos GeoJSON con almacenamiento en caché (@st.cache_data)
-    with st.spinner("Cargando capa GeoJSON de Cuenca Neuquén..."):
+    with st.spinner("Cargando capas geográficas de la Cuenca Neuquén..."):
         gdf_cuenca = load_cuenca_geojson("cuenca_neuquen.geojson")
         gdf_lagos = load_additional_layer("lagos_neuquen.geojson")
         gdf_rios = load_additional_layer("rios_neuquen.geojson")
+        gdf_puntos = load_additional_layer("puntos_neuquen.geojson")
 
     # Métricas del Dashboard
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         n_features = len(gdf_cuenca) if gdf_cuenca is not None else 0
-        st.markdown(f'<div class="metric-card"><h4>Polígonos Registrados</h4><p>{n_features}</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><h4>Cuerpos de Agua</h4><p>{n_features}</p></div>', unsafe_allow_html=True)
 
     with col2:
         crs_name = str(gdf_cuenca.crs) if gdf_cuenca is not None and gdf_cuenca.crs else "N/A"
@@ -86,7 +87,7 @@ def main():
     # Renderizado del mapa interactivo con streamlit-folium
     if gdf_cuenca is not None and not gdf_cuenca.empty:
         st.subheader("📍 Mapa Interactivo")
-        cuenca_map = create_cuenca_map(gdf_cuenca, gdf_rios, gdf_lagos, controls)
+        cuenca_map = create_cuenca_map(gdf_cuenca, gdf_rios, gdf_lagos, gdf_puntos, controls)
 
         # Mostrar mapa Folium de forma directa y fluida
         folium_static(cuenca_map, width=1200, height=600)
