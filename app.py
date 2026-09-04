@@ -1,9 +1,41 @@
-import streamlit as st
-from streamlit_folium import folium_static, st_folium
+import os
 
-from modules.data_loader import load_cuenca_geojson, load_additional_layer
-from modules.sidebar import render_sidebar
+import geopandas as gpd
+import streamlit as st
+from streamlit_folium import folium_static
+
+from modules.data_loader import load_additional_layer, load_cuenca_geojson
 from modules.map_builder import create_cuenca_map
+from modules.sidebar import render_sidebar
+
+@st.cache_data(show_spinner=False)
+def calculate_accurate_metrics():
+    area_str = "N/A"
+    length_str = "N/A"
+    
+    try:
+        file_cuerpos = "cuerpos_agua_neuquen.geojson"
+        if os.path.exists(file_cuerpos):
+            gdf_cuerpos = gpd.read_file(file_cuerpos)
+            if not gdf_cuerpos.empty:
+                gdf_cuerpos_proj = gdf_cuerpos.to_crs(epsg=5343)
+                area_km2 = gdf_cuerpos_proj.geometry.area.sum() / 1e6
+                area_str = f"Total Area: {area_km2:,.2f} km²"
+    except Exception:
+        area_str = "Error calculating area"
+
+    try:
+        file_rios = "rios_neuquen.geojson"
+        if os.path.exists(file_rios):
+            gdf_rios = gpd.read_file(file_rios)
+            if not gdf_rios.empty:
+                gdf_rios_proj = gdf_rios.to_crs(epsg=5343)
+                length_km = gdf_rios_proj.geometry.length.sum() / 1000
+                length_str = f"Total Length: {length_km:,.2f} km"
+    except Exception:
+        length_str = "Error calculating length"
+        
+    return area_str, length_str
 
 # 1. Configuración principal de la aplicación Streamlit
 st.set_page_config(
@@ -48,6 +80,14 @@ st.markdown("""
 def main():
     # Renderizar el menú lateral (Sidebar) y obtener filtros
     controls = render_sidebar()
+
+    # Añadir métricas exactas al sidebar
+    area_str, length_str = calculate_accurate_metrics()
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("📏 Métricas Espaciales (EPSG:5343)")
+        st.metric(label="Cuerpos de Agua", value=area_str)
+        st.metric(label="Ríos", value=length_str)
 
     # Título principal y descripción del Dashboard
     st.title("🌊 Dashboard de Monitoreo Ambiental - Cuenca Neuquén")
@@ -98,6 +138,8 @@ def main():
             st.dataframe(df_display, use_container_width=True)
     else:
         st.info("💡 Asegúrese de colocar el archivo **cuenca_neuquen.geojson** en el directorio raíz de la aplicación para visualizar la cuenca.")
+
+
 
 
 if __name__ == "__main__":

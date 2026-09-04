@@ -1,6 +1,33 @@
 import os
-import streamlit as st
+
 import geopandas as gpd
+import numpy as np
+import pandas as pd
+import rasterio
+import streamlit as st
+
+@st.cache_data(show_spinner=False)
+def generate_mock_flow_data() -> pd.DataFrame:
+    """Generates a mock Pandas DataFrame containing 1 year of daily flow rate data."""
+    np.random.seed(42)
+    dates = pd.date_range(start='2023-01-01', periods=365, freq='D')
+    
+    # Realistic seasonal fluctuations
+    time_idx = np.arange(365)
+    # Peak flow in late winter / spring
+    seasonality = np.sin(2 * np.pi * (time_idx - 150) / 365)
+    
+    # Base flows and amplitudes
+    limay_flow = 300 + 150 * seasonality + np.random.normal(0, 20, 365)
+    neuquen_flow = 150 + 80 * seasonality + np.random.normal(0, 15, 365)
+    
+    df = pd.DataFrame({
+        'Fecha': dates,
+        'Limay - Confluencia': np.maximum(limay_flow, 10),
+        'Neuquén - Paso de los Indios': np.maximum(neuquen_flow, 5)
+    })
+    
+    return df
 
 @st.cache_data(show_spinner=False)
 def load_cuenca_geojson(file_path: str = "cuenca_neuquen.geojson") -> gpd.GeoDataFrame | None:
@@ -53,3 +80,20 @@ def load_additional_layer(file_path: str) -> gpd.GeoDataFrame | None:
         return gdf
     except Exception:
         return None
+
+@st.cache_data(show_spinner=False)
+def load_dem_data(file_path: str):
+    """
+    Abre un archivo raster DEM, lee la primera banda como un array de numpy
+    y extrae el transform y el crs del dataset.
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"No se encontró el archivo '{file_path}'.")
+        
+    with rasterio.open(file_path) as src:
+        array = src.read(1)
+        transform = src.transform
+        crs = src.crs
+        
+    return array, transform, crs
+

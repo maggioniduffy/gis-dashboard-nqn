@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 venv/
 .pytest_cache/
+/datos_ign
+/.streamlit/
+/modules
+/venv
+/AP

@@ -1,6 +1,7 @@
 import folium
 from folium import plugins
 import geopandas as gpd
+import numpy as np
 
 # Estaciones meteorológicas de demostración para el filtro de sidebar
 METEO_STATIONS = [
@@ -85,6 +86,28 @@ def create_cuenca_map(
 
     # 2. Capa de Lagos
     if gdf_lagos is not None and not gdf_lagos.empty and controls.get("show_lagos", True):
+        # Reproject to EPSG:5343 temporarily to calculate area in km2
+        gdf_lagos = gdf_lagos.copy()
+        gdf_lagos_proj = gdf_lagos.to_crs(epsg=5343)
+        
+        name_col_lagos = 'nam' if 'nam' in gdf_lagos.columns else ('fna' if 'fna' in gdf_lagos.columns else ('FNA' if 'FNA' in gdf_lagos.columns else None))
+        
+        areas_temp = gdf_lagos_proj.geometry.area / 1e6
+        if name_col_lagos:
+            # Group by name to calculate the TOTAL area of the whole lake (all tiles/squares combined)
+            gdf_lagos['Area_km2'] = areas_temp.groupby(gdf_lagos[name_col_lagos]).transform('sum').round(2)
+            # If some lakes don't have a name, default to their individual tile area
+            gdf_lagos['Area_km2'] = gdf_lagos['Area_km2'].fillna(areas_temp.round(2))
+        else:
+            gdf_lagos['Area_km2'] = areas_temp.round(2)
+        fields_lagos = []
+        aliases_lagos = []
+        if name_col_lagos:
+            fields_lagos.append(name_col_lagos)
+            aliases_lagos.append("Nombre:")
+        fields_lagos.append('Area_km2')
+        aliases_lagos.append("Área (km²):")
+
         folium.GeoJson(
             gdf_lagos,
             name="Lagos y Embalses",
@@ -94,20 +117,42 @@ def create_cuenca_map(
                 'weight': 1,
                 'fillOpacity': 0.6
             },
-            tooltip=folium.GeoJsonTooltip(fields=['nam'] if 'nam' in gdf_lagos.columns else None)
+            tooltip=folium.GeoJsonTooltip(fields=fields_lagos, aliases=aliases_lagos) if fields_lagos else None
         ).add_to(m)
 
     # 3. Capa de Ríos
     if gdf_rios is not None and not gdf_rios.empty and controls.get("show_rios", True):
+        gdf_rios = gdf_rios.copy()
+        name_col_rios = 'nam' if 'nam' in gdf_rios.columns else ('fna' if 'fna' in gdf_rios.columns else ('FNA' if 'FNA' in gdf_rios.columns else None))
+
+        # We assign the same mock flow to all segments/tiles of the same river
+        if name_col_rios:
+            unique_rivers = gdf_rios[name_col_rios].dropna().unique()
+            river_flows = {river: np.round(np.random.uniform(10.0, 800.0), 1) for river in unique_rivers}
+            gdf_rios['Ultimo_Caudal_m3s'] = gdf_rios[name_col_rios].map(river_flows)
+            # Fill remaining unnamed segments with random flows
+            mask = gdf_rios['Ultimo_Caudal_m3s'].isna()
+            if mask.any():
+                gdf_rios.loc[mask, 'Ultimo_Caudal_m3s'] = np.round(np.random.uniform(10.0, 800.0, size=mask.sum()), 1)
+        else:
+            gdf_rios['Ultimo_Caudal_m3s'] = np.round(np.random.uniform(10.0, 800.0, size=len(gdf_rios)), 1)
+        fields_rios = []
+        aliases_rios = []
+        if name_col_rios:
+            fields_rios.append(name_col_rios)
+            aliases_rios.append("Nombre:")
+        fields_rios.append('Ultimo_Caudal_m3s')
+        aliases_rios.append("Caudal (m³/s):")
+
         folium.GeoJson(
             gdf_rios,
             name="Tramos de Ríos",
             style_function=lambda x: {
                 'color': '#48cae4',
-                'weight': 2.5,
+                'weight': 4.5,  # Increased weight so the lines are easier to hover over
                 'opacity': 0.85
             },
-            tooltip=folium.GeoJsonTooltip(fields=['nam'] if 'nam' in gdf_rios.columns else None)
+            tooltip=folium.GeoJsonTooltip(fields=fields_rios, aliases=aliases_rios) if fields_rios else None
         ).add_to(m)
 
     # 3b. Capa de Puntos de Interés IGN
