@@ -1,12 +1,45 @@
 import os
+import json
 
+import folium
 import geopandas as gpd
+import numpy as np
+import rasterio
 import streamlit as st
-from streamlit_folium import folium_static
+from folium.plugins import Draw
+from rasterio.mask import mask
+from rasterio.transform import array_bounds
+from rasterio.warp import transform_bounds, transform_geom
+from streamlit_folium import st_folium
+from pysheds.grid import Grid
+from pysheds.sview import Raster, ViewFinder
 
 from modules.data_loader import load_additional_layer, load_cuenca_geojson
 from modules.map_builder import create_cuenca_map
 from modules.sidebar import render_sidebar
+
+
+DEM_PATH = "AP/AP_27847_PLR_F6470_RT1.dem.tif"
+RUNOFF_OVERLAY_VERSION = 3
+
+
+def downsample_runoff_mask(mask: np.ndarray, max_dimension: int = 768) -> np.ndarray:
+    """Reduce una máscara booleana preservando los píxeles positivos de cada bloque."""
+    row_factor = max(1, int(np.ceil(mask.shape[0] / max_dimension)))
+    col_factor = max(1, int(np.ceil(mask.shape[1] / max_dimension)))
+    padded_rows = int(np.ceil(mask.shape[0] / row_factor) * row_factor)
+    padded_cols = int(np.ceil(mask.shape[1] / col_factor) * col_factor)
+    padded_mask = np.pad(
+        mask,
+        ((0, padded_rows - mask.shape[0]), (0, padded_cols - mask.shape[1])),
+        constant_values=False,
+    )
+    return padded_mask.reshape(
+        padded_rows // row_factor,
+        row_factor,
+        padded_cols // col_factor,
+        col_factor,
+    ).any(axis=(1, 3))
 
 @st.cache_data(show_spinner=False)
 def calculate_accurate_metrics():
@@ -127,10 +160,177 @@ def main():
     # Renderizado del mapa interactivo con streamlit-folium
     if gdf_cuenca is not None and not gdf_cuenca.empty:
         st.subheader("📍 Mapa Interactivo")
-        cuenca_map = create_cuenca_map(gdf_cuenca, gdf_rios, gdf_lagos, gdf_puntos, controls)
+        # st_folium guarda el resultado del dibujo en session_state antes de
+        # iniciar este rerun, permitiendo calcular la capa sin reiniciar el mapa.
+        last_drawing = st.session_state.get("folium_map_component", {}).get(
+            "last_active_drawing"
+        )
 
-        # Mostrar mapa Folium de forma directa y fluida
-        folium_static(cuenca_map, width=1200, height=600)
+        if last_drawing:
+            geometry = last_drawing.get("geometry", last_drawing)
+            drawing_id = json.dumps(geometry, sort_keys=True)
+
+            if (
+                st.session_state.get("dem_drawing_id") != drawing_id
+                or "runoff_overlay" not in st.session_state
+                or st.session_state.get("runoff_overlay_version")
+                != RUNOFF_OVERLAY_VERSION
+            ):
+                st.session_state.dem_drawing_id = drawing_id
+                try:
+                    with st.spinner("Calculando riesgo de escorrentía..."):
+                        with rasterio.open(DEM_PATH) as dem:
+                            dem_geometry = transform_geom("EPSG:4326", dem.crs, geometry)
+                            cropped_dem, cropped_transform = mask(
+                                dem, [dem_geometry], crop=True, filled=False
+                            )
+                            dem_crs = dem.crs
+
+                        dem_data = cropped_dem[0].astype(np.float64)
+                        valid_cells = ~np.ma.getmaskarray(dem_data)
+                        dem_values = np.where(valid_cells, dem_data.filled(np.nan), np.nan)
+
+                        viewfinder = ViewFinder(
+                            affine=cropped_transform,
+                            shape=dem_values.shape,
+                            nodata=np.nan,
+                            mask=valid_cells,
+                            crs=dem_crs,
+                        )
+                        grid = Grid(viewfinder=viewfinder)
+                        dem_raster = Raster(dem_values, viewfinder=viewfinder)
+
+                        pit_filled_dem = grid.fill_pits(dem_raster)
+                        flooded_dem = grid.fill_depressions(pit_filled_dem)
+                        conditioned_dem = grid.resolve_flats(flooded_dem)
+                        flow_direction = grid.flowdir(conditioned_dem, routing="d8")
+                        flow_accumulation = grid.accumulation(
+                            flow_direction, routing="d8"
+                        )
+
+                        accumulation_values = np.asarray(flow_accumulation)
+                        high_threshold = np.nanpercentile(
+                            accumulation_values[valid_cells], 95
+                        )
+                        high_runoff_mask = valid_cells & (
+                            accumulation_values >= high_threshold
+                        )
+
+                        display_mask = downsample_runoff_mask(high_runoff_mask)
+                        runoff_overlay = np.zeros(
+                            (*display_mask.shape, 4), dtype=np.uint8
+                        )
+                        runoff_overlay[display_mask] = [0, 220, 255, 210]
+
+                        west, south, east, north = array_bounds(
+                            high_runoff_mask.shape[0],
+                            high_runoff_mask.shape[1],
+                            cropped_transform,
+                        )
+                        overlay_bounds = transform_bounds(
+                            dem_crs, "EPSG:4326", west, south, east, north
+                        )
+
+                    st.session_state.runoff_overlay = runoff_overlay
+                    st.session_state.runoff_overlay_bounds = [
+                        [overlay_bounds[1], overlay_bounds[0]],
+                        [overlay_bounds[3], overlay_bounds[2]],
+                    ]
+                    st.session_state.runoff_overlay_version = RUNOFF_OVERLAY_VERSION
+                    st.session_state.dem_crop_error = None
+                except ValueError:
+                    st.session_state.pop("runoff_overlay", None)
+                    st.session_state.pop("runoff_overlay_bounds", None)
+                    st.session_state.dem_crop_error = (
+                        "El área seleccionada no se superpone con el DEM. "
+                        "Dibuje dentro del rectángulo amarillo (Cobertura del DEM)."
+                    )
+
+        # Crear una nueva instancia es necesario porque st_folium procesa el mapa
+        # al renderizarlo. Se conserva el estado aleatorio para que la capa de ríos
+        # no cambie entre reruns y el componente pueda conservarse en el frontend.
+        random_state = np.random.get_state()
+        np.random.seed(42)
+        try:
+            cuenca_map = create_cuenca_map(
+                gdf_cuenca, gdf_rios, gdf_lagos, gdf_puntos, controls
+            )
+        finally:
+            np.random.set_state(random_state)
+
+        # Permitir seleccionar un área de recorte, limitando el dibujo a polígonos y rectángulos.
+        # Mostrar el límite del DEM para guiar la selección de un área con solapamiento.
+        with rasterio.open(DEM_PATH) as dem:
+            dem_bounds_wgs84 = transform_bounds(dem.crs, "EPSG:4326", *dem.bounds)
+        folium.Rectangle(
+            bounds=[
+                [dem_bounds_wgs84[1], dem_bounds_wgs84[0]],
+                [dem_bounds_wgs84[3], dem_bounds_wgs84[2]],
+            ],
+            color="#ffb703",
+            weight=2,
+            fill=False,
+            tooltip="Cobertura del DEM",
+        ).add_to(cuenca_map)
+
+        # Añadir el resultado como una capa dinámica evita reconstruir el mapa.
+        runoff_feature_group = None
+        if "runoff_overlay" in st.session_state:
+            runoff_feature_group = folium.FeatureGroup(
+                name="Zonas de alta acumulación"
+            )
+            folium.raster_layers.ImageOverlay(
+                image=st.session_state.runoff_overlay,
+                bounds=st.session_state.runoff_overlay_bounds,
+                opacity=1,
+                origin="upper",
+                name="Zonas de alta acumulación",
+            ).add_to(runoff_feature_group)
+
+        Draw(
+            draw_options={
+                "polyline": False,
+                "circle": False,
+                "marker": False,
+                "circlemarker": False,
+                "rectangle": {
+                    "shapeOptions": {
+                        "color": "#3388ff",
+                        "weight": 3,
+                        "fillOpacity": 0,
+                    },
+                },
+                "polygon": {
+                    "allowIntersection": False,
+                    "shapeOptions": {
+                        "color": "#3388ff",
+                        "weight": 3,
+                        "fillOpacity": 0,
+                    },
+                },
+            },
+            # El cian queda reservado para el resultado de escorrentía.
+            edit_options={"edit": True, "remove": True},
+        ).add_to(cuenca_map)
+
+        # La capa dinámica se inserta sin cambiar el script base del mapa.
+        st_folium(
+            cuenca_map,
+            width=1200,
+            height=600,
+            key="folium_map_component",
+            returned_objects=["last_active_drawing"],
+            feature_group_to_add=runoff_feature_group,
+        )
+
+        if last_drawing:
+            if st.session_state.get("dem_crop_error"):
+                st.warning(st.session_state.dem_crop_error)
+            else:
+                st.success("Riesgo de escorrentía calculado exitosamente")
+                st.caption(
+                    "Cian: píxeles del percentil 95 o superior de acumulación de flujo."
+                )
 
         # Tabla de atributos expandible
         with st.expander("📄 Ver Atributos de los Polígonos de la Cuenca"):
