@@ -41,10 +41,40 @@ def create_cuenca_map(
         control_scale=True
     )
 
-    # Capas de mapa base
-    folium.TileLayer('CartoDB dark_matter', name='CartoDB Dark Matter', default=True).add_to(m)
-    folium.TileLayer('CartoDB positron', name='CartoDB Positron').add_to(m)
-    folium.TileLayer('OpenStreetMap', name='OpenStreetMap').add_to(m)
+    # Capas de mapa base. Folium's built-in 'CartoDB positron'/'dark_matter'
+    # presets point at basemaps.cartocdn.com, which now requires a registered
+    # API key even for anonymous/low-volume access — the tiles still return
+    # HTTP 200 but with the real map replaced by an "API KEY REQUIRED"
+    # watermark (see carto.com/basemaps/apikey; same issue fixed for the
+    # PyDeck panel in modules/pydeck_layers.py). Esri's Canvas styles serve
+    # real tiles anonymously and match the app's new light theme.
+    #
+    # `show=False` on every layer but the default one is required: base
+    # layers all default to `show=True`, and since they're mutually-exclusive
+    # radio entries in the LayerControl but NOT lazily added, every `show=True`
+    # layer actually gets painted onto the map — the last one added ends up
+    # visually on top regardless of which radio is checked. (The previous
+    # code passed a `default=True` kwarg here, which isn't a real
+    # `folium.TileLayer` parameter — it silently landed in **kwargs and did
+    # nothing, which is how the map ended up defaulting to the dark layer.)
+    folium.TileLayer(
+        tiles="https://services.arcgisonline.com/arcgis/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ",
+        name="Claro (Esri)",
+        show=True,
+    ).add_to(m)
+    folium.TileLayer(
+        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attr="&copy; OpenStreetMap contributors",
+        name="Calles (OSM)",
+        show=False,
+    ).add_to(m)
+    folium.TileLayer(
+        tiles="https://services.arcgisonline.com/arcgis/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ",
+        name="Oscuro (Esri)",
+        show=False,
+    ).add_to(m)
 
     # 1. Capa de Polígonos de Cuenca Neuquén
     if gdf_cuenca is not None and not gdf_cuenca.empty and controls.get("show_cuenca", True):
@@ -52,19 +82,21 @@ def create_cuenca_map(
         bounds = gdf_cuenca.total_bounds  # [minx, miny, maxx, maxy]
         m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
 
-        # Estilo de polígonos
+        # Estilo de polígonos. Los tonos neón (#00c896/#00ffb7) del tema oscuro
+        # original se ven ilegibles sobre un basemap claro; el teal se oscurece
+        # para que el contorno se distinga del fill y del fondo gris claro.
         style_cuenca = {
-            'fillColor': '#00c896',
-            'color': '#00ffb7',
-            'weight': 2,
-            'fillOpacity': 0.35
+            'fillColor': '#0f766e',
+            'color': '#0b4f4a',
+            'weight': 1.5,
+            'fillOpacity': 0.25
         }
 
         highlight_cuenca = {
-            'fillColor': '#00ffb7',
-            'color': '#ffffff',
+            'fillColor': '#14b8a6',
+            'color': '#0b4f4a',
             'weight': 3,
-            'fillOpacity': 0.65
+            'fillOpacity': 0.55
         }
 
         fields = [c for c in ['nam', 'gna', 'fna', 'objeto', 'gid'] if c in gdf_cuenca.columns]
@@ -111,9 +143,12 @@ def create_cuenca_map(
         folium.GeoJson(
             gdf_lagos,
             name="Lagos y Embalses",
+            # Contorno oscurecido (antes #90e0ef, un cian pálido pensado para
+            # fondo oscuro) para que el borde se distinga del fill y del
+            # basemap claro en vez de perderse en él.
             style_function=lambda x: {
                 'fillColor': '#0077b6',
-                'color': '#90e0ef',
+                'color': '#023e8a',
                 'weight': 1,
                 'fillOpacity': 0.6
             },
@@ -147,9 +182,12 @@ def create_cuenca_map(
         folium.GeoJson(
             gdf_rios,
             name="Tramos de Ríos",
+            # #48cae4 (cian pálido) es casi invisible sobre un basemap claro;
+            # un azul más saturado mantiene el contraste sin competir con el
+            # cian reservado para el overlay de escorrentía.
             style_function=lambda x: {
-                'color': '#48cae4',
-                'weight': 4.5,  # Increased weight so the lines are easier to hover over
+                'color': '#0369a1',
+                'weight': 3,  # Fino mantiene la lectura "técnica"; sigue siendo fácil de hover.
                 'opacity': 0.85
             },
             tooltip=folium.GeoJsonTooltip(fields=fields_rios, aliases=aliases_rios) if fields_rios else None
@@ -184,12 +222,12 @@ def create_cuenca_map(
 
             popup_content = f"""
             <div style="font-family: Arial, sans-serif; min-width: 170px;">
-                <h4 style="margin:0 0 6px 0; color:#00c896;">{st_data['name']}</h4>
+                <h4 style="margin:0 0 6px 0; color:#0f766e;">{st_data['name']}</h4>
                 <hr style="margin:4px 0; border:0; border-top:1px solid #ddd;">
                 <p style="margin:3px 0;"><b>Temperatura:</b> {st_data['temp']}</p>
                 <p style="margin:3px 0;"><b>Humedad:</b> {st_data['hum']}</p>
                 <p style="margin:3px 0;"><b>Precipitación:</b> {st_data['precip']}</p>
-                <p style="margin:3px 0;"><b>Estado:</b> <span style="color:#00c896; font-weight:bold;">{st_data['status']}</span></p>
+                <p style="margin:3px 0;"><b>Estado:</b> <span style="color:#0f766e; font-weight:bold;">{st_data['status']}</span></p>
             </div>
             """
 

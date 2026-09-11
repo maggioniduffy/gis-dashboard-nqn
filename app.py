@@ -12,6 +12,7 @@ from streamlit_folium import st_folium
 from modules.data_loader import load_additional_layer, load_cuenca_geojson
 from modules.ee_client import (
     DEM_SOURCES,
+    EE_PROJECT_ID,
     PROVINCIAL_DEM_PATH,
     EarthEngineError,
     check_provincial_dem_export,
@@ -134,33 +135,38 @@ def render_dem_panel():
 
 
 @st.cache_data(show_spinner=False)
-def calculate_accurate_metrics():
-    area_str = "N/A"
-    length_str = "N/A"
-    
+def calculate_accurate_metrics() -> tuple[float | None, float | None]:
+    """
+    Total water-body area (km²) and river length (km), both computed on the
+    metric CRS (EPSG:5343) rather than read off the raw GeoJSON — reprojecting
+    first is what makes these figures accurate instead of a degrees-based
+    approximation. Returns raw floats (`None` on a read/compute failure) so
+    every call site formats them for its own context instead of inheriting a
+    hard-coded label/unit string.
+    """
+    area_km2 = None
     try:
         file_cuerpos = "cuerpos_agua_neuquen.geojson"
         if os.path.exists(file_cuerpos):
             gdf_cuerpos = gpd.read_file(file_cuerpos)
             if not gdf_cuerpos.empty:
                 gdf_cuerpos_proj = gdf_cuerpos.to_crs(epsg=5343)
-                area_km2 = gdf_cuerpos_proj.geometry.area.sum() / 1e6
-                area_str = f"Total Area: {area_km2:,.2f} km²"
+                area_km2 = float(gdf_cuerpos_proj.geometry.area.sum() / 1e6)
     except Exception:
-        area_str = "Error calculating area"
+        area_km2 = None
 
+    length_km = None
     try:
         file_rios = "rios_neuquen.geojson"
         if os.path.exists(file_rios):
             gdf_rios = gpd.read_file(file_rios)
             if not gdf_rios.empty:
                 gdf_rios_proj = gdf_rios.to_crs(epsg=5343)
-                length_km = gdf_rios_proj.geometry.length.sum() / 1000
-                length_str = f"Total Length: {length_km:,.2f} km"
+                length_km = float(gdf_rios_proj.geometry.length.sum() / 1000)
     except Exception:
-        length_str = "Error calculating length"
-        
-    return area_str, length_str
+        length_km = None
+
+    return area_km2, length_km
 
 # 1. Configuración principal de la aplicación Streamlit
 st.set_page_config(
@@ -170,58 +176,167 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 2. Estilos CSS personalizados para tarjetas e interfaz
+# 2. Estilos CSS: tema claro/técnico. Inter para el cuerpo del texto, JetBrains
+# Mono reservada para lecturas numéricas/técnicas (KPIs, chips de metadata) —
+# el contraste entre ambas tipografías es lo que le da el aspecto de
+# instrumento técnico en vez de una página de texto plano. Los colores
+# repiten la paleta de .streamlit/config.toml (no está disponible desde CSS,
+# así que se hardcodea acá también) para que los componentes nativos de
+# Streamlit y este HTML custom queden visualmente unificados.
 st.markdown("""
     <style>
-    .main .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     }
+
+    .main .block-container {
+        padding-top: 1.75rem;
+        padding-bottom: 2.5rem;
+        max-width: 1320px;
+    }
+
+    /* Encabezado: título + bajada + fila de chips de metadata técnica
+       (fuentes de datos, CRS, proyecto de Earth Engine). */
+    .app-header h1 {
+        font-size: 1.85rem;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        margin: 0 0 0.3rem 0;
+    }
+    .app-subtitle {
+        color: #5b6b7a;
+        font-size: 0.95rem;
+        max-width: 800px;
+        line-height: 1.55;
+        margin-bottom: 0.6rem;
+    }
+    .app-meta-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 1.1rem;
+    }
+    .tech-chip {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.72rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: #0f766e;
+        background: #e6f4f2;
+        border: 1px solid #bfe4df;
+        border-radius: 999px;
+        padding: 3px 11px;
+        white-space: nowrap;
+    }
+
+    /* Tarjetas KPI: valor en monospace (lectura tipo instrumento), etiqueta
+       muda en versalitas pequeñas. */
     .metric-card {
-        background-color: #161b22;
-        border: 1px solid #30363d;
-        border-radius: 10px;
-        padding: 16px;
-        text-align: center;
-        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.25);
+        background-color: #ffffff;
+        border: 1px solid #e3e8ec;
+        border-radius: 12px;
+        padding: 14px 18px;
+        height: 100%;
+        box-shadow: 0 1px 3px rgba(15, 23, 30, 0.06);
     }
     .metric-card h4 {
         margin: 0;
-        color: #8b949e;
-        font-size: 0.85rem;
+        color: #5b6b7a;
+        font-size: 0.7rem;
+        font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.07em;
     }
     .metric-card p {
-        margin: 6px 0 0 0;
-        color: #00c896;
-        font-size: 1.5rem;
-        font-weight: bold;
+        margin: 5px 0 0 0;
+        color: #0f766e;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 1.35rem;
+        font-weight: 700;
+        line-height: 1.2;
+    }
+    .metric-card small {
+        display: block;
+        margin-top: 2px;
+        color: #8c98a4;
+        font-size: 0.72rem;
+        font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* Expanders con el mismo tratamiento de tarjeta que los KPIs, para que
+       los paneles 3D/tablas se sientan parte del mismo sistema visual. */
+    div[data-testid="stExpander"] {
+        border: 1px solid #e3e8ec;
+        border-radius: 12px;
+        box-shadow: 0 1px 3px rgba(15, 23, 30, 0.05);
+    }
+
+    hr {
+        margin: 0.9rem 0;
+        border-color: #e3e8ec !important;
+    }
+
+    section[data-testid="stSidebar"] h3 {
+        font-size: 0.92rem;
+        letter-spacing: 0.01em;
     }
     </style>
 """, unsafe_allow_html=True)
+
+
+def _render_header():
+    """
+    Título + bajada + fila de chips técnicos (fuentes de datos, CRS de
+    referencia, proyecto de Earth Engine). Reemplaza el `st.title` simple
+    original: da contexto técnico de un vistazo sin ocupar una sección
+    aparte, en línea con el resto del dashboard.
+    """
+    st.markdown(
+        f"""
+        <div class="app-header">
+          <h1>🌊 Monitoreo Ambiental — Cuenca Neuquén</h1>
+          <div class="app-subtitle">
+            Plataforma de visualización geoespacial e hidrológica: precipitación (CHIRPS) y
+            temperatura (ERA5-Land) vía Google Earth Engine, análisis de escorrentía sobre DEM
+            provincial, y capas vectoriales de cuerpos de agua, ríos y estaciones meteorológicas
+            de la <strong>Cuenca del Neuquén</strong>.
+          </div>
+          <div class="app-meta-row">
+            <span class="tech-chip">GEE · {EE_PROJECT_ID}</span>
+            <span class="tech-chip">CRS vis · EPSG:4326</span>
+            <span class="tech-chip">CRS cálculo · EPSG:5343</span>
+            <span class="tech-chip">DEM · AW3D30 / SRTM</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def main():
     # Renderizar el menú lateral (Sidebar) y obtener filtros
     controls = render_sidebar()
 
-    # Añadir métricas exactas al sidebar
-    area_str, length_str = calculate_accurate_metrics()
+    # Métricas espaciales exactas (EPSG:5343), compartidas entre el sidebar y
+    # el KPI row principal más abajo — se calculan una sola vez acá.
+    area_km2, length_km = calculate_accurate_metrics()
     with st.sidebar:
         st.markdown("---")
         st.subheader("📏 Métricas Espaciales (EPSG:5343)")
-        st.metric(label="Cuerpos de Agua", value=area_str)
-        st.metric(label="Ríos", value=length_str)
+        st.metric(
+            label="Cuerpos de Agua",
+            value=f"{area_km2:,.2f} km²" if area_km2 is not None else "N/D",
+        )
+        st.metric(
+            label="Ríos",
+            value=f"{length_km:,.2f} km" if length_km is not None else "N/D",
+        )
 
     render_dem_panel()
 
-    # Título principal y descripción del Dashboard
-    st.title("🌊 Dashboard de Monitoreo Ambiental - Cuenca Neuquén")
-    st.markdown(
-        "Plataforma interactiva para la visualización de capas geográficas, análisis hidrológico "
-        "y monitoreo de estaciones meteorológicas en la **Cuenca del Neuquén**."
-    )
+    _render_header()
 
     # Carga de datos GeoJSON con almacenamiento en caché (@st.cache_data)
     with st.spinner("Cargando capas geográficas de la Cuenca Neuquén..."):
@@ -230,26 +345,46 @@ def main():
         gdf_rios = load_additional_layer("rios_neuquen.geojson")
         gdf_puntos = load_additional_layer("puntos_neuquen.geojson")
 
-    # Métricas del Dashboard
-    # col1, col2, col3, col4 = st.columns(4)
-    # with col1:
-    #     n_features = len(gdf_cuenca) if gdf_cuenca is not None else 0
-    #     st.markdown(f'<div class="metric-card"><h4>Cuerpos de Agua</h4><p>{n_features}</p></div>', unsafe_allow_html=True)
+    # KPI row: mismas .metric-card definidas en el CSS de arriba, con datos
+    # reales en vez de placeholders — área/longitud recién calculadas, CRS
+    # nativo del GeoJSON cargado, y el filtro de estación activo.
+    n_features = len(gdf_cuenca) if gdf_cuenca is not None else 0
+    crs_name = str(gdf_cuenca.crs) if gdf_cuenca is not None and gdf_cuenca.crs else "N/D"
+    filtro_txt = controls["selected_estacion"]
+    if len(filtro_txt) > 24:
+        filtro_txt = filtro_txt[:22] + "…"
 
-    # with col2:
-    #     crs_name = str(gdf_cuenca.crs) if gdf_cuenca is not None and gdf_cuenca.crs else "N/A"
-    #     st.markdown(f'<div class="metric-card"><h4>Sistema de Coordenadas</h4><p>{crs_name}</p></div>', unsafe_allow_html=True)
+    kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
+    with kpi_col1:
+        st.markdown(
+            '<div class="metric-card"><h4>Cuerpos de agua</h4>'
+            f'<p>{area_km2:,.1f}<small>km²</small></p></div>'
+            if area_km2 is not None
+            else '<div class="metric-card"><h4>Cuerpos de agua</h4><p>N/D</p></div>',
+            unsafe_allow_html=True,
+        )
+    with kpi_col2:
+        st.markdown(
+            '<div class="metric-card"><h4>Longitud de ríos</h4>'
+            f'<p>{length_km:,.1f}<small>km</small></p></div>'
+            if length_km is not None
+            else '<div class="metric-card"><h4>Longitud de ríos</h4><p>N/D</p></div>',
+            unsafe_allow_html=True,
+        )
+    with kpi_col3:
+        st.markdown(
+            f'<div class="metric-card"><h4>Geometrías de cuenca</h4>'
+            f'<p>{n_features}<small>{crs_name}</small></p></div>',
+            unsafe_allow_html=True,
+        )
+    with kpi_col4:
+        st.markdown(
+            f'<div class="metric-card"><h4>Filtro de estación</h4>'
+            f'<p style="font-size:1rem;">{filtro_txt}</p></div>',
+            unsafe_allow_html=True,
+        )
 
-    # with col3:
-    #     st.markdown('<div class="metric-card"><h4>Estaciones Activas</h4><p>5 Estaciones</p></div>', unsafe_allow_html=True)
-
-    # with col4:
-    #     filtro_txt = controls['selected_estacion']
-    #     if len(filtro_txt) > 20:
-    #         filtro_txt = filtro_txt[:18] + "..."
-    #     st.markdown(f'<div class="metric-card"><h4>Filtro de Estación</h4><p style="color: #58a6ff;">{filtro_txt}</p></div>', unsafe_allow_html=True)
-
-    # st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
 
     # Renderizado del mapa interactivo con streamlit-folium
     if gdf_cuenca is not None and not gdf_cuenca.empty:
@@ -538,6 +673,34 @@ def main():
         with st.expander("📄 Ver Atributos de los Polígonos de la Cuenca"):
             df_display = gdf_cuenca.drop(columns=["geometry"], errors="ignore")
             st.dataframe(df_display, use_container_width=True)
+
+        # Ficha técnica: fuentes de datos, CRS y ubicación del caché — documenta
+        # de dónde sale cada capa sin tener que leer el código fuente.
+        with st.expander("ℹ️ Fuentes de datos y metodología"):
+            st.markdown(
+                f"""
+| Capa | Fuente | Resolución nativa | Notas |
+|---|---|---|---|
+| Precipitación | CHIRPS Daily (`UCSB-CHG/CHIRPS/DAILY`) | ~5.5 km | Acumulada o promedio anual 2016–2026, vía Earth Engine. |
+| Temperatura | ERA5-Land Monthly (`ECMWF/ERA5_LAND/MONTHLY_AGGR`) | ~9–11 km | Banda `temperature_2m`, convertida de Kelvin a °C. |
+| DEM provincial | AW3D30 (JAXA) / SRTM (USGS) | 30 m | Mosaico único, usado para el análisis de escorrentía. |
+| Límite provincial | FAO GAUL 2015, nivel 1 | — | Recorte oficial de Neuquén; con fallback al polígono local. |
+| Cuerpos de agua / ríos / puntos | IGN (`*_neuquen.geojson`) | — | 2.161 cuerpos de agua y ríos digitalizados. |
+
+**CRS**: EPSG:4326 para visualización (Folium/PyDeck), EPSG:5343 (POSGAR 2007 / Argentina 1) para
+áreas, longitudes y el pipeline hidrológico D8, de modo que las celdas del raster sean cuadradas
+en metros.
+
+**Proyecto de Earth Engine**: `{EE_PROJECT_ID}`. Los rasters descargados se cachean en
+`./data/cache/`, por rango de fechas/agregación — una misma capa climática no vuelve a pedirse
+a Earth Engine si ya está en disco.
+
+**Cruce Precipitación × Temperatura**: CHIRPS (~5.5 km) y ERA5-Land (~9–11 km) tienen resoluciones
+nativas distintas; el panel 3D combinado las alinea celda a celda reproyectando ambas a EPSG:5343
+y resampleando la más gruesa (ERA5-Land) sobre la grilla de la más fina (CHIRPS) con interpolación
+bilineal antes de vectorizar.
+                """
+            )
     else:
         st.info("💡 Asegúrese de colocar el archivo **cuenca_neuquen.geojson** en el directorio raíz de la aplicación para visualizar la cuenca.")
 

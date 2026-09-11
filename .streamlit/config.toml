@@ -1,8 +1,13 @@
 [theme]
-primaryColor = "#00c896"
-backgroundColor = "#0e1117"
-secondaryBackgroundColor = "#161b22"
-textColor = "#f0f6fc"
+# Light, technical palette: cool near-white background, slate ink text, a
+# sober teal accent (darkened from the old dark-theme neon #00c896 so it
+# still passes contrast on white instead of just glowing). secondaryBackgroundColor
+# is the sidebar / widget surface — a hair darker than the page background so
+# panels read as distinct cards without a hard border everywhere.
+primaryColor = "#0f766e"
+backgroundColor = "#f7f9fb"
+secondaryBackgroundColor = "#eef1f4"
+textColor = "#1b2430"
 font = "sans serif"
 
 [server]
