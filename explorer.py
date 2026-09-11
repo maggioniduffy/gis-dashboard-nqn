@@ -11,5 +11,5 @@ print("\n--- Columnas disponibles ---")
 print(gdf_areas.columns.tolist())
 
 print("\nPloteando mapa (cerrá la ventana del mapa para que el script termine)...")
-gdf_areas.plot(color='blue')
+gdf_areas.plot(color='gray')
 plt.show()

@@ -3,7 +3,6 @@ import os
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-import rasterio
 import streamlit as st
 
 @st.cache_data(show_spinner=False)
@@ -80,20 +79,3 @@ def load_additional_layer(file_path: str) -> gpd.GeoDataFrame | None:
         return gdf
     except Exception:
         return None
-
-@st.cache_data(show_spinner=False)
-def load_dem_data(file_path: str):
-    """
-    Abre un archivo raster DEM, lee la primera banda como un array de numpy
-    y extrae el transform y el crs del dataset.
-    """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"No se encontró el archivo '{file_path}'.")
-        
-    with rasterio.open(file_path) as src:
-        array = src.read(1)
-        transform = src.transform
-        crs = src.crs
-        
-    return array, transform, crs
-
