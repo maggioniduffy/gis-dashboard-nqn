@@ -30,7 +30,7 @@ from modules.hydrology import (
     compute_runoff_overlay,
     get_dem_bounds_wgs84,
 )
-from modules.map_builder import create_cuenca_map
+from modules.map_builder import add_layer_control, create_cuenca_map
 from modules.pydeck_layers import (
     BASEMAP_TILE_URLS,
     DEFAULT_BASEMAP,
@@ -44,7 +44,7 @@ from modules.raster_processing import (
     align_flow_accumulation_to_climate_grid,
     raster_to_classified_gdf,
 )
-from modules.sidebar import render_sidebar
+from modules.sidebar import render_height_variable_selector, render_sidebar
 
 
 RUNOFF_OVERLAY_VERSION = 4
@@ -318,8 +318,9 @@ def render_polygon_3d_panel(analysis_grid, height_variable: str) -> None:
     Panel 3D poblado con la grilla del análisis en curso.
 
     Precipitación y Temperatura se cruzan sobre la grilla provincial completa;
-    solo "Acumulación de flujo" queda acotada al área dibujada, porque es la
-    única columna con NaN fuera de ella (build_pydeck_layer descarta esas filas).
+    "Acumulación de flujo" es el cruce de las tres variables (altura = flujo,
+    color = precipitación, temperatura en el tooltip) y queda acotado al área
+    dibujada, porque flow_value es NaN fuera de ella.
     """
     if analysis_grid is None or analysis_grid.empty:
         return
@@ -347,19 +348,24 @@ def render_polygon_3d_panel(analysis_grid, height_variable: str) -> None:
             color_tooltip_label=layer_spec.color_label,
             color_unit=layer_spec.color_unit,
             elevation_scale=layer_spec.elevation_scale,
+            tooltip_extras=layer_spec.tooltip_extras,
         )
-        if layer_spec.is_single_variable:
+        if layer_spec.polygon_only:
             st.caption(
-                f"Altura y color de columnas: {layer_spec.height_label} "
-                f"({layer_spec.height_unit}) · acotado al polígono dibujado "
-                f"({len(layer_spec.df)} celdas), verde→rojo de menor a mayor riesgo."
+                f"Altura: {layer_spec.height_label} ({layer_spec.height_unit}) · "
+                f"Color: {layer_spec.color_label} ({layer_spec.color_unit}), "
+                f"verde→rojo de menor a mayor · Temperatura en el tooltip · "
+                f"acotado al polígono dibujado ({len(layer_spec.df)} celdas). "
+                f"Columnas altas y rojas = mayor riesgo."
             )
         else:
             st.caption(
                 f"Altura de columnas: {layer_spec.height_label} "
                 f"({layer_spec.height_unit}) · "
                 f"Color de columnas: {layer_spec.color_label} "
-                f"({layer_spec.color_unit}) · grilla provincial completa."
+                f"({layer_spec.color_unit}) · grilla provincial completa. "
+                f"Para cruzar con la hidrología del polígono elegí "
+                f"«Acumulación de flujo (riesgo)» en el panel lateral."
             )
 
 
@@ -478,6 +484,16 @@ st.markdown("""
 
     html, body, [class*="css"], .stApp, .stApp * {
         font-family: 'Source Serif 4', Georgia, 'Times New Roman', serif;
+    }
+
+    /* La regla de arriba (`.stApp *`) también le pisa la tipografía a los
+       íconos de Material que Streamlit renderiza como ligaduras (la flecha
+       de los expanders, el ojo de los inputs de contraseña, etc.): sin la
+       fuente de íconos, el navegador muestra el nombre literal de la
+       ligadura ("keyboard_double_arrow_right") en vez del glifo. Se
+       restaura la fuente de íconos solo para esos elementos. */
+    [data-testid="stIconMaterial"] {
+        font-family: 'Material Symbols Rounded' !important;
     }
 
     .main .block-container {
@@ -705,9 +721,23 @@ def main():
 
         # st_folium guarda el resultado del dibujo en session_state antes de
         # iniciar este rerun, permitiendo calcular la capa sin reiniciar el mapa.
-        last_drawing = st.session_state.get("folium_map_component", {}).get(
-            "last_active_drawing"
+        map_state = st.session_state.get("folium_map_component") or {}
+        # st_folium NO limpia last_active_drawing al borrar el polígono con la
+        # herramienta de Draw (Leaflet.draw manda `e.layers` en draw:deleted,
+        # no `e.layer`), así que el polígono borrado seguía "activo" y con él
+        # la opción de acumulación de flujo. all_drawings sí refleja el borrado.
+        last_drawing = (
+            map_state.get("last_active_drawing") if map_state.get("all_drawings") else None
         )
+
+        if not last_drawing:
+            # Sin polígono en el mapa no hay análisis vigente: se descarta el
+            # anterior para que ni el panel 3D ni el selector usen datos viejos.
+            for stale_key in (
+                "polygon_analysis", "flow_variable_available", "dem_drawing_id",
+                "runoff_overlay", "runoff_overlay_bounds", "dem_crop_error",
+            ):
+                st.session_state.pop(stale_key, None)
 
         if last_drawing:
             geometry = last_drawing.get("geometry", last_drawing)
@@ -775,6 +805,16 @@ def main():
                 # Gate del selector del sidebar: la opción "flow" solo existe si
                 # esta iteración realmente produjo celdas con flow_value.
                 st.session_state.flow_variable_available = analysis["has_flow_variable"]
+
+        # El selector de "Variable → Altura de columnas" se renderiza recién
+        # ahora (en el slot que render_sidebar reservó), porque depende del
+        # análisis que acaba de correr en ESTE rerun.
+        controls["cross_height_var"] = render_height_variable_selector(
+            controls["height_selector_slot"],
+            polygon_panel_active=st.session_state.get("polygon_analysis") is not None,
+            flow_available=st.session_state.get("flow_variable_available", False),
+            enable_climate_cross=controls["enable_climate_cross"],
+        )
 
         # Crear una nueva instancia es necesario porque st_folium procesa el mapa
         # al renderizarlo. Se conserva el estado aleatorio para que la capa de ríos
@@ -890,6 +930,10 @@ def main():
             edit_options={"edit": True, "remove": True},
         ).add_to(cuenca_map)
 
+        # Siempre al final: el control tiene que emitirse después de todas las
+        # capas (incluida la climática), si no el mapa 2D queda en 0 px.
+        add_layer_control(cuenca_map)
+
         # La capa dinámica se inserta sin cambiar el script base del mapa.
         # Va dentro de map_container (reservado arriba) para que el iframe
         # conserve siempre la misma posición en el árbol de elementos.
@@ -899,7 +943,7 @@ def main():
                 width=1200,
                 height=600,
                 key="folium_map_component",
-                returned_objects=["last_active_drawing"],
+                returned_objects=["last_active_drawing", "all_drawings"],
                 feature_group_to_add=runoff_feature_group,
             )
 
@@ -988,11 +1032,9 @@ def main():
                             color_tooltip_label=layer_spec.color_label,
                             color_unit=layer_spec.color_unit,
                             elevation_scale=layer_spec.elevation_scale,
+                            tooltip_extras=layer_spec.tooltip_extras,
                         )
                         st.caption(
-                            f"Altura de columnas: {layer_spec.height_label} "
-                            f"({layer_spec.height_unit})"
-                            if layer_spec.is_single_variable else
                             f"Altura de columnas: {layer_spec.height_label} "
                             f"({layer_spec.height_unit}) · "
                             f"Color de columnas: {layer_spec.color_label} "

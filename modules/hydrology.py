@@ -53,6 +53,18 @@ DEFAULT_RUNOFF_COEFFICIENT = 0.3
 # so the UI can warn the user instead of presenting the number as reliable.
 RATIONAL_METHOD_MAX_AREA_KM2 = 2.5
 
+# `calculate_peak_flow`'s only caller (`app.py`'s `run_polygon_analysis`) always
+# passes `load_combined_climate_grid()`'s grid, whose "precip_value" column is
+# CHIRPS aggregated with `aggregation="mean"` over a multi-year range (see
+# CLIMATE_LAYER_CONFIG["Promedio lluvias"] and `ee_client.fetch_chirps_precipitation`,
+# which computes `collection.sum().divide(n_years)`) — i.e. a mean ANNUAL
+# accumulated depth in mm/year, not an hourly rate. Dividing by this converts
+# that annual depth into an average hourly rate (mm/h) before it's used as "I"
+# in the Rational Method; without it, a mean annual total (routinely in the
+# hundreds-to-low-thousands of mm) got plugged in as-is where the formula
+# expects a storm intensity in mm/h, inflating Q by a factor of ~8766x.
+HOURS_PER_YEAR = 24 * 365.25
+
 
 class DemCoverageError(ValueError):
     """The drawn polygon can't be analyzed with the available DEM (message is user-facing)."""
@@ -258,11 +270,13 @@ def calculate_peak_flow(
     derives I from an IDF (intensity-duration-frequency) curve evaluated at
     the sub-basin's time of concentration, for a chosen return period. This
     function does not have IDF curves available, so it instead uses the
-    area-weighted CHIRPS value from `precip_gdf` directly as a stand-in for
-    "I" (mm/h). Depending on how `precip_gdf` was aggregated upstream (see
-    `ee_client.fetch_and_cache_chirps`'s `aggregation` parameter), this is a
-    rough order-of-magnitude proxy rather than a true design-storm intensity —
-    treat the resulting Q as indicative, not a design value.
+    area-weighted CHIRPS value from `precip_gdf` — a mean ANNUAL accumulated
+    depth (mm/year), per `HOURS_PER_YEAR`'s comment above — converted to an
+    average hourly rate (mm/h) as a stand-in for "I". That is still a rough
+    order-of-magnitude proxy rather than a true design-storm intensity (a
+    real storm concentrates far more rain per hour than the yearly average
+    spread evenly across every hour of the year) — treat the resulting Q as
+    a coarse lower-bound indicator, not a design value.
 
     Args:
         geometry: GeoJSON geometry dict in EPSG:4326 (WGS84), same format as
@@ -342,7 +356,11 @@ def calculate_peak_flow(
             "para esta área (el análisis de topografía puede seguir funcionando)."
         )
 
-    intensity_mm_h = float((candidates[value_column] * intersection_areas).sum() / covered_area)
+    # Area-weighted mean ANNUAL depth (mm/year) — see `HOURS_PER_YEAR`'s
+    # comment for why this is what `precip_gdf` actually holds, not an
+    # hourly rate yet.
+    intensity_mm_year = float((candidates[value_column] * intersection_areas).sum() / covered_area)
+    intensity_mm_h = intensity_mm_year / HOURS_PER_YEAR
 
     runoff_coefficient = (
         land_use_coefficient if land_use_coefficient is not None else DEFAULT_RUNOFF_COEFFICIENT

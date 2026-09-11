@@ -80,17 +80,33 @@ DEFAULT_PITCH = 45.0
 # combined grid, so each one takes the OTHER as its color variable — that's the
 # "altura = una variable, color = la otra" cross panel.
 #
-# "flow" is different: Pysheds flow accumulation has no natural second variable
-# to pair against (it's joined onto the climate grid on demand by
-# `raster_processing.align_flow_accumulation_to_climate_grid`, only over the
-# polygon the user drew), so it drives BOTH height and color through the
-# green->yellow->red "risk" ramp. `build_pydeck_layer` detects that
-# height_column == color_column and drops the redundant second tooltip line.
+# "flow" is the three-way precipitation x temperature x hydrology cross, only
+# available over the polygon the user drew (flow accumulation is joined onto
+# the climate grid on demand by
+# `raster_processing.align_flow_accumulation_to_climate_grid`). Height is
+# where water CONCENTRATES (flow accumulation) and color is where it RAINS
+# most, on the green->yellow->red "risk" ramp — so tall red columns are the
+# riskiest cells. Temperature, the third variable, goes in the tooltip.
 #
-# Units note: D8 flow accumulation counts UPSTREAM CELLS, not a physical
-# discharge — hence "celdas". For a precipitation-driven flow estimate in m^3/s
-# see `hydrology.calculate_peak_flow` (Rational Method), which is a separate
-# calculation shown next to the 2D map.
+# "tooltip_extras" are (column, label, unit) shown in the tooltip on top of
+# the height/color variables, whenever the grid has that column (cells
+# outside the drawn polygon have NaN flow_value, which the tooltip skips).
+#
+# "log_height": True (only "flow") applies log1p to the COLUMN HEIGHT alone —
+# D8 flow accumulation is extremely skewed (a handful of stream cells with
+# orders of magnitude more accumulated cells than everything around them), so
+# a linear scale draws one or two spikes and leaves the rest of the polygon
+# flat. The tooltip still reports the real (untransformed) value, since it
+# reads `value`/the raw column, not the log-compressed `elevation_value` that
+# only feeds the ColumnLayer's height (see build_pydeck_layer).
+#
+# Units note: `flow_value` is UPSTREAM DRAINAGE AREA in km², not the raw D8
+# cell count Pysheds actually produces — a bare cell count means nothing
+# without knowing the DEM's resolution, so
+# `raster_processing.align_flow_accumulation_to_climate_grid` converts it
+# (cell count × pixel area) before it ever reaches this module. For a
+# precipitation-driven flow estimate in m^3/s see `hydrology.calculate_peak_flow`
+# (Rational Method), which is a separate calculation shown next to the 2D map.
 HEIGHT_VARIABLE_SPECS = {
     "precip": {
         "selector_label": "Precipitación",
@@ -101,6 +117,7 @@ HEIGHT_VARIABLE_SPECS = {
         "color_label": "Temperatura",
         "color_unit": "°C",
         "color_scheme": "temperature",
+        "tooltip_extras": [("flow_value", "Área de drenaje acumulada", "km²")],
     },
     "temp": {
         "selector_label": "Temperatura",
@@ -111,16 +128,19 @@ HEIGHT_VARIABLE_SPECS = {
         "color_label": "Precipitación",
         "color_unit": "mm",
         "color_scheme": "average",
+        "tooltip_extras": [("flow_value", "Área de drenaje acumulada", "km²")],
     },
     "flow": {
         "selector_label": "Acumulación de flujo (riesgo)",
         "height_column": "flow_value",
-        "height_label": "Acumulación de flujo",
-        "height_unit": "celdas",
-        "color_column": "flow_value",
-        "color_label": "Acumulación de flujo",
-        "color_unit": "celdas",
+        "height_label": "Área de drenaje acumulada",
+        "height_unit": "km²",
+        "color_column": "precip_value",
+        "color_label": "Precipitación",
+        "color_unit": "mm",
         "color_scheme": "risk",
+        "tooltip_extras": [("temp_value", "Temperatura", "°C")],
+        "log_height": True,
     },
 }
 
@@ -129,6 +149,7 @@ HEIGHT_VARIABLE_SPECS = {
 # polygon (see `height_variable_options`).
 HEIGHT_VARIABLE_ORDER = ("precip", "temp", "flow")
 FLOW_HEIGHT_VARIABLE = "flow"
+FLOW_UNIT = HEIGHT_VARIABLE_SPECS[FLOW_HEIGHT_VARIABLE]["height_unit"]
 
 
 def height_variable_options(include_flow: bool) -> dict[str, str]:
@@ -371,13 +392,19 @@ def _compute_elevation_auto_scale(df: pd.DataFrame) -> float:
     extent, so the panel stays legible regardless of whether values are
     ~1.000 mm (annual average) or ~13.000 mm (decade accumulation).
 
+    Reads `elevation_value` when present (the log-compressed field
+    `build_pydeck_layer` adds for "flow", see HEIGHT_VARIABLE_SPECS'
+    "log_height") instead of the raw `value` the tooltip shows, so the scale
+    matches whatever column `getElevation` actually extrudes.
+
     Returns 0.0 when `df` is empty or has no positive value (callers treat
     that as "nothing to render").
     """
     if df is None or df.empty:
         return 0.0
 
-    max_value = float(df["value"].max())
+    elevation_column = "elevation_value" if "elevation_value" in df.columns else "value"
+    max_value = float(df[elevation_column].max())
     if max_value <= 0:
         return 0.0
 
@@ -444,6 +471,7 @@ def _build_live_panel_html(
     color_tooltip_label: str | None = None,
     color_unit: str | None = None,
     elevation_scale: float = NEUTRAL_ELEVATION_SCALE,
+    tooltip_extras: list[tuple[str, str, str]] | None = None,
 ) -> str:
     """
     Standalone HTML page: deck.gl basemap + ColumnLayer, driven by its own
@@ -452,7 +480,8 @@ def _build_live_panel_html(
     variable driving column COLOR (`color_value`, present when `records`
     comes from `gdf_to_pydeck_df_dual`) — used by the combined precipitation
     x temperature panel so the tooltip shows both variables instead of just
-    the one driving height.
+    the one driving height. `tooltip_extras` are further (record key, label,
+    unit) tooltip lines; a record whose value is null skips that line.
 
     `elevation_scale` is only the STARTING position of the elevation slider
     (NEUTRAL_ELEVATION_SCALE = "no exaggeration"); the user can move it freely
@@ -468,6 +497,8 @@ def _build_live_panel_html(
     unit_json = json.dumps(unit)
     color_tooltip_label_json = json.dumps(color_tooltip_label)
     color_unit_json = json.dumps(color_unit)
+    tooltip_extras_json = json.dumps(tooltip_extras or [])
+    flow_unit_json = json.dumps(FLOW_UNIT)
 
     return f"""
 <div id="deck-root" style="position:relative;width:100%;height:{height}px;
@@ -506,6 +537,14 @@ def _build_live_panel_html(
   const HEIGHT_UNIT = {unit_json};
   const COLOR_LABEL = {color_tooltip_label_json};
   const COLOR_UNIT = {color_unit_json};
+  const TOOLTIP_EXTRAS = {tooltip_extras_json};
+  const FLOW_UNIT = {flow_unit_json};
+
+  // Drainage area (km²) needs more decimals than mm/°C: a single DEM pixel
+  // is ~0.0009 km², so toFixed(1) would flatten every small basin to "0.0".
+  function formatValue(value, unit) {{
+    return unit === FLOW_UNIT ? value.toFixed(2) : value.toFixed(1);
+  }}
 
   let bearing = {DEFAULT_BEARING};
   let pitch = {DEFAULT_PITCH};
@@ -550,7 +589,9 @@ def _build_live_panel_html(
       radius: RADIUS * Math.sqrt(2) * 0.98,
       elevationScale: appliedScale,
       getPosition: (d) => [d.lon, d.lat],
-      getElevation: (d) => d.value,
+      // `elevation_value` is the log-compressed field (see build_pydeck_layer's
+      // "log_height"); falls back to the raw `value` when it isn't present.
+      getElevation: (d) => d.elevation_value ?? d.value,
       getFillColor: (d) => d.color,
       extruded: true,
       pickable: true,
@@ -565,9 +606,16 @@ def _build_live_panel_html(
     layers: [basemapLayer, buildColumnLayer()],
     getTooltip: ({{object}}) => {{
       if (!object) return null;
-      let text = `${{HEIGHT_LABEL}}: ${{object.value.toFixed(1)}} ${{HEIGHT_UNIT}}`;
-      if (COLOR_LABEL !== null && object.color_value !== undefined) {{
-        text += ` | ${{COLOR_LABEL}}: ${{object.color_value.toFixed(1)}} ${{COLOR_UNIT}}`;
+      let text = `${{HEIGHT_LABEL}}: ${{formatValue(object.value, HEIGHT_UNIT)}} ${{HEIGHT_UNIT}}`;
+      if (COLOR_LABEL !== null && object.color_value != null) {{
+        text += ` | ${{COLOR_LABEL}}: ${{formatValue(object.color_value, COLOR_UNIT)}} ${{COLOR_UNIT}}`;
+      }}
+      // Third variable of the cross (e.g. flow accumulation, null for cells
+      // outside the drawn polygon, or temperature in the "flow" mode).
+      for (const [key, label, unit] of TOOLTIP_EXTRAS) {{
+        if (object[key] != null) {{
+          text += ` | ${{label}}: ${{formatValue(object[key], unit)}} ${{unit}}`;
+        }}
       }}
       return {{text}};
     }},
@@ -624,6 +672,7 @@ def render_3d_panel_live(
     color_tooltip_label: str | None = None,
     color_unit: str | None = None,
     elevation_scale: float = NEUTRAL_ELEVATION_SCALE,
+    tooltip_extras: list[tuple[str, str, str]] | None = None,
 ) -> None:
     """
     Renders the 3D climate panel as a self-contained deck.gl page embedded
@@ -644,6 +693,9 @@ def render_3d_panel_live(
     shows both variables. Left as `None` (the default) for a single-variable
     panel built from `gdf_to_pydeck_df`, where height and color already come
     from the same column.
+
+    `tooltip_extras` are (column, label, unit) for extra tooltip lines; only
+    the ones whose column is in `df` are used.
     """
     auto_scale = _compute_elevation_auto_scale(df)
     if auto_scale <= 0:
@@ -654,7 +706,16 @@ def render_3d_panel_live(
     record_columns = ["lon", "lat", "value", "color"]
     if "color_value" in df.columns:
         record_columns.append("color_value")
-    records = df[record_columns].to_dict(orient="records")
+    if "elevation_value" in df.columns:
+        record_columns.append("elevation_value")
+    tooltip_extras = [extra for extra in (tooltip_extras or []) if extra[0] in df.columns]
+    record_columns.extend(column for column, _, _ in tooltip_extras)
+    # NaN -> None so json.dumps emits `null` (cells outside the drawn polygon
+    # have no flow value); the JS tooltip skips null values.
+    records = (
+        df[record_columns].astype(object).where(df[record_columns].notna(), None)
+        .to_dict(orient="records")
+    )
     tile_url = BASEMAP_TILE_URLS.get(basemap, BASEMAP_TILE_URLS[DEFAULT_BASEMAP])
 
     html = _build_live_panel_html(
@@ -671,6 +732,7 @@ def render_3d_panel_live(
         color_tooltip_label=color_tooltip_label,
         color_unit=color_unit,
         elevation_scale=elevation_scale,
+        tooltip_extras=tooltip_extras,
     )
     components.html(html, height=height, scrolling=False)
 
@@ -681,9 +743,8 @@ class PydeckLayerSpec:
     Everything `render_3d_panel_live` needs for one height-variable choice,
     plus the colormap itself so a caller can draw a matching legend.
 
-    `color_label`/`color_unit` are None when height and color come from the
-    SAME column (the "flow" case), which is how the renderer knows to skip
-    the redundant second tooltip line.
+    `polygon_only` is True for the "flow" cross, whose cells are restricted
+    to the drawn polygon (the only place flow accumulation exists).
     """
 
     df: pd.DataFrame
@@ -691,14 +752,11 @@ class PydeckLayerSpec:
     colormap: bcm.LinearColormap
     height_label: str
     height_unit: str
-    color_label: str | None
-    color_unit: str | None
+    color_label: str
+    color_unit: str
+    tooltip_extras: list[tuple[str, str, str]]
+    polygon_only: bool
     elevation_scale: float
-
-    @property
-    def is_single_variable(self) -> bool:
-        """True when one variable drives both height and color."""
-        return self.color_label is None
 
 
 def build_pydeck_layer(
@@ -715,8 +773,12 @@ def build_pydeck_layer(
     `gdf` is expected to be a per-cell grid (one row per cell), i.e. the
     output of `raster_processing.align_climate_grids` — optionally with a
     `flow_value` column joined on by
-    `raster_processing.align_flow_accumulation_to_climate_grid` when
-    `height_variable="flow"`.
+    `raster_processing.align_flow_accumulation_to_climate_grid` when a
+    polygon was drawn.
+
+    "flow" keeps only the cells with a flow value, so the panel (and its
+    auto-fitted view) zooms to the drawn polygon, with precipitation as color
+    and temperature in the tooltip.
 
     Returns None when there's nothing renderable: an empty/None `gdf`, or a
     `gdf` missing the columns this `height_variable` needs (e.g. "flow"
@@ -743,12 +805,8 @@ def build_pydeck_layer(
         return None
 
     # Rows where either driving column is null would render as zero-height or
-    # uncolored columns; drop them so the panel only shows real cells. The two
-    # columns are the same one in the "flow" case, hence the dedup.
-    driving_columns = [height_column]
-    if color_column != height_column:
-        driving_columns.append(color_column)
-    renderable = gdf.dropna(subset=driving_columns)
+    # uncolored columns; drop them so the panel only shows real cells.
+    renderable = gdf.dropna(subset=[height_column, color_column])
     if renderable.empty:
         return None
 
@@ -760,10 +818,19 @@ def build_pydeck_layer(
     )
     df = gdf_to_pydeck_df_dual(renderable, height_column, color_column, colormap)
 
-    # One variable driving both height and color (flow accumulation) means the
-    # color tooltip would just repeat the height tooltip — left as None so
-    # `render_3d_panel_live` emits a single line.
-    single_variable = height_column == color_column
+    # Carry the third variable of the cross along for the tooltip (e.g. flow
+    # accumulation, NaN outside the polygon -> no extra line). Only when the
+    # grid has it: without a polygon there is no flow_value column at all.
+    # `gdf_to_pydeck_df_dual` keeps `renderable`'s row order, and its result
+    # is a cache copy, so adding columns here is safe.
+    tooltip_extras = [extra for extra in spec["tooltip_extras"] if extra[0] in renderable.columns]
+    for column, _, _ in tooltip_extras:
+        df[column] = renderable[column].astype(float).to_numpy()
+
+    # log1p-compress the extruded height alone (see HEIGHT_VARIABLE_SPECS'
+    # "log_height" comment) — `value` stays the raw figure the tooltip shows.
+    if spec.get("log_height"):
+        df["elevation_value"] = np.log1p(df["value"].to_numpy())
 
     return PydeckLayerSpec(
         df=df,
@@ -771,7 +838,9 @@ def build_pydeck_layer(
         colormap=colormap,
         height_label=spec["height_label"],
         height_unit=spec["height_unit"],
-        color_label=None if single_variable else spec["color_label"],
-        color_unit=None if single_variable else spec["color_unit"],
+        color_label=spec["color_label"],
+        color_unit=spec["color_unit"],
+        tooltip_extras=tooltip_extras,
+        polygon_only=height_variable == FLOW_HEIGHT_VARIABLE,
         elevation_scale=elevation_scale,
     )

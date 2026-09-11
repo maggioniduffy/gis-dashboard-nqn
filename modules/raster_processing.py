@@ -18,6 +18,7 @@ import rasterio.transform
 import rasterio.windows
 import streamlit as st
 from rasterio.features import geometry_mask, shapes as rasterio_shapes
+from rasterio.transform import array_bounds
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from shapely.geometry import box, shape
 
@@ -487,12 +488,22 @@ def align_flow_accumulation_to_climate_grid(
     — this function is purely the join/resample between two results that
     already exist.
 
+    `flow_accum_array` holds Pysheds' raw D8 output — a COUNT of upstream
+    cells per pixel, meaningless on its own without knowing the DEM's cell
+    size. This function converts it to upstream DRAINAGE AREA in km² (cell
+    count × pixel area, from `dem_transform`) before aggregating, so
+    `value_column` ends up in a standard, self-explanatory hydrology unit
+    instead of a raw "cells" count that means nothing without more context.
+    `dem_transform`'s pixel size is assumed to be in meters (true for
+    `hydrology.compute_runoff_overlay`'s output, always in the DEM's native
+    metric CRS — see `ee_client.DEM_CRS`); passing a transform in degrees
+    would silently produce a bogus area.
+
     `aggregation="max"` (the default) takes, for each climate cell, the
-    highest flow accumulation among the DEM pixels it covers — appropriate
-    for a RISK indicator, where a single high-accumulation stream cell
-    crossing a coarse climate cell matters more than diluting it into an
-    average. Pass `aggregation="mean"` for a smoother, less spike-sensitive
-    view instead.
+    highest drainage area among the DEM pixels it covers — appropriate for a
+    RISK indicator, where a single high-accumulation stream cell crossing a
+    coarse climate cell matters more than diluting it into an average. Pass
+    `aggregation="mean"` for a smoother, less spike-sensitive view instead.
 
     Because `flow_accum_array` only covers the user-drawn polygon's bounding
     box (Pysheds runs on-the-fly per polygon, never province-wide), cells
@@ -510,7 +521,7 @@ def align_flow_accumulation_to_climate_grid(
     never covered.
 
     Returns a copy of `climate_gdf`, in `climate_gdf`'s original CRS, with one
-    added `value_column` (NaN outside the flow accumulation footprint).
+    added `value_column` in km² (NaN outside the flow accumulation footprint).
     Returns `climate_gdf` unchanged if it's empty/None.
     """
     if climate_gdf is None or climate_gdf.empty:
@@ -524,8 +535,22 @@ def align_flow_accumulation_to_climate_grid(
     # step to instead evaluate each climate polygon directly against it.
     climate_projected = climate_gdf.to_crs(dem_crs)
 
-    aggregated = _zonal_stat_per_feature(
-        flow_accum_array, dem_transform, climate_projected.geometry, aggregation
+    # Cell count -> upstream drainage area (km²): see the "km²" paragraph
+    # above. Multiplying the whole array once, up front, means every
+    # aggregate (max/mean) below is computed directly in km² instead of
+    # needing a second unit conversion after the fact.
+    pixel_area_km2 = abs(dem_transform.a * dem_transform.e) / 1e6
+    drainage_area_array = flow_accum_array * pixel_area_km2
+
+    # Only climate cells touching the flow accumulation crop (the drawn
+    # polygon's footprint) are aggregated; the rest of the province is left
+    # as NaN without ever being windowed against the raster.
+    flow_footprint = box(*array_bounds(*flow_accum_array.shape, dem_transform))
+    in_footprint = climate_projected.intersects(flow_footprint).to_numpy()
+
+    aggregated = np.full(len(climate_projected), np.nan, dtype="float64")
+    aggregated[in_footprint] = _zonal_stat_per_feature(
+        drainage_area_array, dem_transform, climate_projected.geometry[in_footprint], aggregation
     )
 
     climate_projected = climate_projected.copy()

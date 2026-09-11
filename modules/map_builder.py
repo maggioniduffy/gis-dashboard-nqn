@@ -249,6 +249,17 @@ def create_cuenca_map(
     # Herramientas interactivas
     plugins.Fullscreen().add_to(m)
     plugins.MeasureControl(position='bottomleft').add_to(m)
-    folium.LayerControl(position='topright').add_to(m)
 
+    # No LayerControl here on purpose: the caller adds it as the map's LAST
+    # child (see `add_layer_control`). Folium does collect every layer at
+    # render time, but it emits the control's JS at the position where it was
+    # added — so a layer added afterwards (the climate GeoJson in app.py) is
+    # referenced by the control before its `var` is assigned, Leaflet gets
+    # `undefined`, throws in `_addLayer`, and the st_folium iframe never
+    # reports its height: the 2D map collapses to 0px.
     return m
+
+
+def add_layer_control(m: folium.Map) -> None:
+    """Adds the LayerControl. Must be called after every other layer is on `m`."""
+    folium.LayerControl(position='topright').add_to(m)

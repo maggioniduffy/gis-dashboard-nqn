@@ -63,12 +63,12 @@ def add_climate_layer_to_map(
          by sampling that colormap;
       3. attaches the colormap itself to the map, which renders it as a
          visible legend (branca's `add_to` draws an HTML/SVG gradient bar);
-      4. the GeoJson layer is automatically discoverable by an existing
-         `folium.LayerControl` even if that control was already added to the
-         map earlier (e.g. inside `map_builder.create_cuenca_map`) — Folium's
-         LayerControl scans the map's children at render time (when the map
-         is actually drawn/saved), not at the moment `LayerControl.add_to()`
-         was called, so layers added afterwards still show up as toggleable.
+      4. the GeoJson layer shows up in the map's `folium.LayerControl`, as
+         long as that control is added AFTER this call (see
+         `map_builder.add_layer_control`). Folium collects the layers at
+         render time, but emits the control's JS where it was added, so a
+         control added earlier references this layer before it exists and
+         Leaflet throws, blanking the whole map.
 
     `tooltip_label` is the field label shown on hover (e.g. "Temperatura (°C):"
     for an ERA5-Land layer); defaults to the original precipitation wording so
