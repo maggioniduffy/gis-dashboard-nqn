@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 from datetime import datetime
 
 import folium
@@ -21,18 +22,28 @@ from modules.ee_client import (
     get_provincial_dem_status,
     update_provincial_dem,
 )
-from modules.folium_layers import add_climate_layer_to_map, build_colormap
-from modules.hydrology import DemCoverageError, compute_runoff_overlay, get_dem_bounds_wgs84
+from modules.folium_layers import add_climate_layer_to_map
+from modules.hydrology import (
+    DemCoverageError,
+    PrecipCoverageError,
+    calculate_peak_flow,
+    compute_runoff_overlay,
+    get_dem_bounds_wgs84,
+)
 from modules.map_builder import create_cuenca_map
 from modules.pydeck_layers import (
     BASEMAP_TILE_URLS,
     DEFAULT_BASEMAP,
     build_isometric_view_state,
+    build_pydeck_layer,
     gdf_to_pydeck_df,
-    gdf_to_pydeck_df_dual,
     render_3d_panel_live,
 )
-from modules.raster_processing import align_climate_grids, raster_to_classified_gdf
+from modules.raster_processing import (
+    align_climate_grids,
+    align_flow_accumulation_to_climate_grid,
+    raster_to_classified_gdf,
+)
 from modules.sidebar import render_sidebar
 
 
@@ -74,6 +85,282 @@ CLIMATE_LAYER_CONFIG = {
         "unit": "°C",
     },
 }
+
+
+logger = logging.getLogger(__name__)
+
+# Human-readable name for each step of `run_polygon_analysis`, reused by the
+# debug log and by the UI's "what completed / what didn't" summary so both
+# call the same thing by the same name.
+ANALYSIS_STEP_LABELS = {
+    "runoff": "Escorrentía (Pysheds D8)",
+    "peak_flow": "Caudal pico (Método Racional)",
+    "grid_3d": "Grilla 3D (precipitación × temperatura × flujo)",
+}
+
+
+def load_combined_climate_grid() -> gpd.GeoDataFrame:
+    """
+    THE single precipitation/temperature grid the whole polygon analysis reads
+    from — both the Rational Method (as its rainfall intensity source) and the
+    3D panel (as the grid flow accumulation is joined onto).
+
+    Having one shared grid is the point: the "I" behind a reported Q is then
+    literally the same cell value the user sees extruded in the 3D panel,
+    instead of coming from a second, independently-built vectorization of the
+    same CHIRPS raster that can drift from it (`raster_to_classified_gdf`
+    merges runs of same-class pixels into irregular regions, while
+    `align_climate_grids` keeps one square polygon per physical cell — same
+    source raster, different geometry AND different per-feature values).
+
+    This adds NO new cache layer: `fetch_and_cache_chirps` /
+    `fetch_and_cache_era5_temperature` hit the existing on-disk raster cache
+    and `align_climate_grids` is `st.cache_data`-memoized, so calling this
+    from several places within one rerun costs a cache lookup rather than a
+    re-download or a re-alignment.
+
+    Note that `st.cache_data` hands back an equal COPY, not the same object
+    (that's its documented mutation-safety behaviour, verified here). So
+    "both calculations read the same grid" is NOT guaranteed by the cache —
+    it's guaranteed by `run_polygon_analysis` taking the grid as a single
+    parameter and passing that one object to both consumers. Call this once
+    per rerun and thread the result through; don't call it again deeper down.
+    """
+    precip_config = CLIMATE_LAYER_CONFIG["Promedio lluvias"]
+    temp_config = CLIMATE_LAYER_CONFIG["Temperatura promedio 2016-2026"]
+
+    precip_raster_path = fetch_and_cache_chirps(
+        geojson_path=CUENCA_GEOJSON_PATH,
+        start_date=precip_config["start_date"],
+        end_date=precip_config["end_date"],
+        aggregation=precip_config["aggregation"],
+    )
+    temp_raster_path = fetch_and_cache_era5_temperature(
+        geojson_path=CUENCA_GEOJSON_PATH,
+        start_date=temp_config["start_date"],
+        end_date=temp_config["end_date"],
+        aggregation=temp_config["aggregation"],
+    )
+    return align_climate_grids(precip_raster_path, temp_raster_path)
+
+
+def run_polygon_analysis(
+    geometry: dict,
+    dem_path: str,
+    climate_grid: gpd.GeoDataFrame | None,
+) -> dict:
+    """
+    Everything that happens when the user draws a polygon, in one pass and in
+    a fixed order:
+
+      1. "runoff"   - Pysheds D8 routing + flow accumulation  (topography only)
+      2. "peak_flow"- Rational Method Q = C*I*A               (precipitation only)
+      3. "grid_3d"  - climate grid + step 1's flow accumulation joined on
+
+    Steps 1 and 2 are INDEPENDENT and each has its own error boundary: a
+    polygon outside the DEM still gets a peak flow estimate, and a polygon
+    outside CHIRPS coverage still gets its runoff overlay. Step 3 degrades
+    rather than fails — without step 1 it still returns the precip/temp grid,
+    only without the "flow" height variable.
+
+    `climate_grid` must be `load_combined_climate_grid()`'s result (or None if
+    it couldn't be loaded); it is read here and NOT re-derived, so steps 2 and
+    3 are guaranteed to be looking at the same cells.
+
+    Every step logs its outcome at INFO/WARNING with the same step labels the
+    UI shows, so a confusing panel can be traced in the server log.
+
+    Returns:
+        {
+          "runoff": dict | None,          # compute_runoff_overlay's result
+          "peak_flow": dict | None,       # calculate_peak_flow's result
+          "grid_3d": GeoDataFrame | None, # grid for the 3D panel
+          "has_flow_variable": bool,      # is "flow" selectable in the panel?
+          "errors": {step: message | None},
+          "completed": [step, ...],
+        }
+    Never raises for the expected coverage failures; unexpected exceptions in
+    step 3 are caught and reported rather than taking down steps 1 and 2.
+    """
+    result = {
+        "runoff": None,
+        "peak_flow": None,
+        "grid_3d": None,
+        "has_flow_variable": False,
+        "errors": {step: None for step in ANALYSIS_STEP_LABELS},
+        "completed": [],
+    }
+
+    def _succeed(step: str, detail: str) -> None:
+        result["completed"].append(step)
+        logger.info("polygon analysis | %s | OK | %s", ANALYSIS_STEP_LABELS[step], detail)
+
+    def _fail(step: str, message: str) -> None:
+        result["errors"][step] = message
+        logger.warning("polygon analysis | %s | FAILED | %s", ANALYSIS_STEP_LABELS[step], message)
+
+    logger.info("polygon analysis | start | climate_grid=%s cells",
+                0 if climate_grid is None else len(climate_grid))
+
+    # --- Step 1: topography (Pysheds D8) ---
+    try:
+        result["runoff"] = compute_runoff_overlay(geometry, dem_path)
+        _succeed("runoff", f"overlay {result['runoff']['overlay'].shape}, "
+                           f"partial_coverage={result['runoff']['partial_coverage']}")
+    except DemCoverageError as coverage_error:
+        _fail("runoff", str(coverage_error))
+
+    # --- Step 2: precipitation (Rational Method) — independent of step 1 ---
+    if climate_grid is None:
+        _fail("peak_flow", "No hay grilla climática disponible (CHIRPS/ERA5-Land).")
+    else:
+        try:
+            # Reads `climate_grid`'s own "precip_value" column; calculate_peak_flow
+            # auto-detects it, so no second precipitation source is involved.
+            result["peak_flow"] = calculate_peak_flow(geometry, climate_grid)
+            _succeed("peak_flow", f"Q={result['peak_flow']['Q_m3_s']:.3f} m3/s, "
+                                  f"I={result['peak_flow']['I_mm_h']:.2f} mm/h, "
+                                  f"A={result['peak_flow']['A_km2']:.3f} km2")
+        except PrecipCoverageError as precip_error:
+            _fail("peak_flow", str(precip_error))
+
+    # --- Step 3: 3D grid — needs step 1 for the "flow" variable, degrades without it ---
+    if climate_grid is None:
+        _fail("grid_3d", "No hay grilla climática disponible (CHIRPS/ERA5-Land).")
+    elif result["runoff"] is None:
+        # Pysheds failed: the panel still works with precipitation x temperature,
+        # just without the flow accumulation variable.
+        result["grid_3d"] = climate_grid
+        _fail("grid_3d", "Sin acumulación de flujo: el análisis de topografía no se completó. "
+                         "El panel 3D queda con precipitación y temperatura únicamente.")
+    else:
+        try:
+            joined_grid = align_flow_accumulation_to_climate_grid(
+                result["runoff"]["flow_accumulation"],
+                result["runoff"]["flow_transform"],
+                result["runoff"]["flow_crs"],
+                climate_grid,
+            )
+            # The join keeps every climate cell and marks the ones outside the
+            # polygon with NaN, so the precipitation x temperature cross still
+            # spans the whole province; only the "flow" variable is restricted
+            # to the drawn area (build_pydeck_layer drops the NaN rows).
+            covered_cells = int(joined_grid["flow_value"].notna().sum())
+            result["grid_3d"] = joined_grid
+            if covered_cells == 0:
+                # The drawn polygon is smaller than / misses every climate cell.
+                _fail("grid_3d", "El polígono no cubre ninguna celda climática completa; "
+                                 "el panel 3D queda con precipitación y temperatura únicamente.")
+            else:
+                result["has_flow_variable"] = True
+                _succeed("grid_3d", f"{len(joined_grid)} celdas en la grilla, "
+                                    f"{covered_cells} con flow_value")
+        except Exception as grid_error:  # noqa: BLE001 - reported, never fatal for steps 1-2
+            result["grid_3d"] = climate_grid
+            _fail("grid_3d", f"Error inesperado alineando la acumulación de flujo: {grid_error}")
+            logger.exception("polygon analysis | grid_3d raised")
+
+    logger.info("polygon analysis | done | completed=%s failed=%s",
+                result["completed"],
+                [step for step, msg in result["errors"].items() if msg])
+    return result
+
+
+def render_analysis_status(analysis: dict) -> None:
+    """
+    Estado del análisis del polígono + caudal pico estimado.
+
+    Un paso fallido nunca oculta a los que sí corrieron: se listan todos los
+    errores y después se muestra lo que haya podido calcularse.
+    """
+    for step, label in ANALYSIS_STEP_LABELS.items():
+        error_message = analysis["errors"][step]
+        if error_message:
+            st.warning(f"⚠️ {label}: {error_message}")
+
+    if "runoff" in analysis["completed"]:
+        st.success("Riesgo de escorrentía calculado exitosamente")
+        if analysis["runoff"]["partial_coverage"]:
+            st.warning(
+                "Parte del polígono cae fuera del DEM provincial; "
+                "el análisis cubre solo el área con datos."
+            )
+        st.caption("Cian: píxeles del percentil 95 o superior de acumulación de flujo.")
+
+    # El "I" de este caudal sale de la misma grilla climática que alimenta el
+    # panel 3D (ver load_combined_climate_grid), no de una lectura aparte.
+    peak_flow_result = analysis["peak_flow"]
+    if not peak_flow_result:
+        return
+
+    metric_col, breakdown_col = st.columns([1, 2])
+    with metric_col:
+        st.metric(
+            "Caudal pico estimado (Método Racional)",
+            f"{peak_flow_result['Q_m3_s']:.2f} m³/s",
+        )
+    with breakdown_col:
+        st.caption(
+            f"Q = C × I × A / 360 · C = {peak_flow_result['C']:.2f}"
+            f"{' (default, estepa/suelo natural)' if peak_flow_result['C_is_default'] else ''}"
+            f" · I = {peak_flow_result['I_mm_h']:.2f} mm/h (CHIRPS, prom. histórico)"
+            f" · A = {peak_flow_result['A_km2']:.2f} km²"
+        )
+        if not peak_flow_result["method_valid_for_basin_size"]:
+            st.warning(
+                "El área dibujada supera ~2.5 km²: el Método Racional está "
+                "pensado para cuencas pequeñas y este valor es solo orientativo."
+            )
+
+
+def render_polygon_3d_panel(analysis_grid, height_variable: str) -> None:
+    """
+    Panel 3D poblado con la grilla del análisis en curso.
+
+    Precipitación y Temperatura se cruzan sobre la grilla provincial completa;
+    solo "Acumulación de flujo" queda acotada al área dibujada, porque es la
+    única columna con NaN fuera de ella (build_pydeck_layer descarta esas filas).
+    """
+    if analysis_grid is None or analysis_grid.empty:
+        return
+
+    with st.expander("🧊 Panel 3D (PyDeck)", expanded=True):
+        layer_spec = build_pydeck_layer(analysis_grid, height_variable)
+        if layer_spec is None:
+            st.info(
+                "La variable seleccionada no tiene datos para este polígono. "
+                "Elegí otra en «Variable → Altura de columnas» del panel lateral."
+            )
+            return
+
+        basemap = st.selectbox(
+            "Mapa base",
+            options=list(BASEMAP_TILE_URLS.keys()),
+            index=list(BASEMAP_TILE_URLS.keys()).index(DEFAULT_BASEMAP),
+            help="Mapa base dibujado debajo de las columnas 3D.",
+            key="polygon_basemap_select",
+        )
+        render_3d_panel_live(
+            layer_spec.df, layer_spec.view_state, basemap=basemap,
+            tooltip_label=layer_spec.height_label,
+            unit=layer_spec.height_unit,
+            color_tooltip_label=layer_spec.color_label,
+            color_unit=layer_spec.color_unit,
+            elevation_scale=layer_spec.elevation_scale,
+        )
+        if layer_spec.is_single_variable:
+            st.caption(
+                f"Altura y color de columnas: {layer_spec.height_label} "
+                f"({layer_spec.height_unit}) · acotado al polígono dibujado "
+                f"({len(layer_spec.df)} celdas), verde→rojo de menor a mayor riesgo."
+            )
+        else:
+            st.caption(
+                f"Altura de columnas: {layer_spec.height_label} "
+                f"({layer_spec.height_unit}) · "
+                f"Color de columnas: {layer_spec.color_label} "
+                f"({layer_spec.color_unit}) · grilla provincial completa."
+            )
 
 
 def _format_local_time(iso_timestamp: str) -> str:
@@ -176,19 +463,21 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 2. Estilos CSS: tema claro/técnico. Inter para el cuerpo del texto, JetBrains
-# Mono reservada para lecturas numéricas/técnicas (KPIs, chips de metadata) —
-# el contraste entre ambas tipografías es lo que le da el aspecto de
-# instrumento técnico en vez de una página de texto plano. Los colores
-# repiten la paleta de .streamlit/config.toml (no está disponible desde CSS,
-# así que se hardcodea acá también) para que los componentes nativos de
-# Streamlit y este HTML custom queden visualmente unificados.
+# 2. Estilos CSS: tema claro/técnico. La tipografía serif (Source Serif 4,
+# estilo Claude) se define a nivel de tema en .streamlit/config.toml
+# (theme.font / theme.headingFont), que es lo que realmente llega a todos
+# los widgets nativos de Streamlit (botones, inputs, tablas, sidebar) — el
+# CSS inyectado acá solo alcanza el contenedor principal, por eso se
+# mantiene como refuerzo/fallback. JetBrains Mono se reserva para lecturas
+# numéricas/técnicas (KPIs, chips de metadata); el contraste entre ambas
+# tipografías es lo que le da el aspecto de instrumento técnico en vez de
+# una página de texto plano.
 st.markdown("""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600;8..60,700&family=JetBrains+Mono:wght@400;600;700&display=swap');
 
-    html, body, [class*="css"] {
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    html, body, [class*="css"], .stApp, .stApp * {
+        font-family: 'Source Serif 4', Georgia, 'Times New Roman', serif;
     }
 
     .main .block-container {
@@ -316,6 +605,10 @@ def _render_header():
 
 
 def main():
+    # Header (título + bajada + chips) va primero: es lo primero que se
+    # renderiza en la página, antes del sidebar y del panel DEM.
+    _render_header()
+
     # Renderizar el menú lateral (Sidebar) y obtener filtros
     controls = render_sidebar()
 
@@ -335,8 +628,6 @@ def main():
         )
 
     render_dem_panel()
-
-    _render_header()
 
     # Carga de datos GeoJSON con almacenamiento en caché (@st.cache_data)
     with st.spinner("Cargando capas geográficas de la Cuenca Neuquén..."):
@@ -389,6 +680,29 @@ def main():
     # Renderizado del mapa interactivo con streamlit-folium
     if gdf_cuenca is not None and not gdf_cuenca.empty:
         st.subheader("📍 Mapa Interactivo")
+
+        # Slots FIJOS para los dos iframes de la página (el mapa de Folium y el
+        # panel 3D de deck.gl), reservados acá arriba antes de cualquier trabajo
+        # condicional.
+        #
+        # Por qué: Streamlit identifica cada componente por su posición en el
+        # árbol de elementos (su "delta path"), no por el orden en que se
+        # escribe el código. Todo lo que se renderiza condicionalmente más
+        # abajo — los st.spinner del cálculo, los st.error de la capa
+        # climática, los st.warning de estado del análisis — aparece en unos
+        # reruns y no en otros, y corre la posición de todo lo que viene
+        # después. Cuando el iframe del mapa cambia de posición, el frontend
+        # desmonta el que ya estaba y monta uno nuevo: eso es exactamente el
+        # "el mapa 2D desaparece después de cualquier cálculo".
+        #
+        # Un st.container() reserva su lugar en el árbol en el momento en que
+        # se crea, y todo lo que se escriba después con `with` cae en ese lugar
+        # reservado. Así la posición de ambos iframes queda fija sin importar
+        # cuántos elementos transitorios aparezcan en el medio.
+        map_container = st.container()
+        analysis_results_container = st.container()
+        panel_3d_container = st.container()
+
         # st_folium guarda el resultado del dibujo en session_state antes de
         # iniciar este rerun, permitiendo calcular la capa sin reiniciar el mapa.
         last_drawing = st.session_state.get("folium_map_component", {}).get(
@@ -412,19 +726,55 @@ def main():
                 != RUNOFF_OVERLAY_VERSION
             ):
                 st.session_state.dem_drawing_id = drawing_id
-                try:
-                    with st.spinner("Calculando riesgo de escorrentía..."):
-                        runoff = compute_runoff_overlay(geometry, PROVINCIAL_DEM_PATH)
 
+                # UN solo flujo por polígono dibujado: Pysheds -> Método Racional
+                # -> grilla 3D, en ese orden, leyendo todos la MISMA grilla
+                # climática cacheada (load_combined_climate_grid). Antes esto
+                # eran dos bloques separados que vectorizaban CHIRPS por su
+                # cuenta y podían quedar desincronizados entre sí.
+                climate_grid = None
+                climate_grid_error = None
+                try:
+                    with st.spinner("Cargando grilla climática (CHIRPS × ERA5-Land)..."):
+                        climate_grid = load_combined_climate_grid()
+                except EarthEngineError as ee_error:
+                    climate_grid_error = (
+                        f"No se pudo obtener precipitación/temperatura de Earth Engine: {ee_error}"
+                    )
+                    logger.warning("polygon analysis | climate grid unavailable | %s", ee_error)
+                except Exception as grid_error:  # noqa: BLE001 - Pysheds debe poder seguir igual
+                    climate_grid_error = f"Error inesperado cargando la grilla climática: {grid_error}"
+                    logger.exception("polygon analysis | climate grid raised")
+
+                with st.spinner("Analizando el polígono (escorrentía, caudal y grilla 3D)..."):
+                    analysis = run_polygon_analysis(
+                        geometry, PROVINCIAL_DEM_PATH, climate_grid
+                    )
+
+                # Un fallo al traer la grilla climática es más informativo que el
+                # "no hay grilla disponible" genérico que reporta el orquestador.
+                if climate_grid_error:
+                    for step in ("peak_flow", "grid_3d"):
+                        analysis["errors"][step] = climate_grid_error
+
+                st.session_state.polygon_analysis = analysis
+
+                # La capa 2D de Folium sigue leyendo estas claves, así que se
+                # derivan del resultado unificado en vez de calcularse aparte.
+                runoff = analysis["runoff"]
+                if runoff is not None:
                     st.session_state.runoff_overlay = runoff["overlay"]
                     st.session_state.runoff_overlay_bounds = runoff["bounds"]
                     st.session_state.runoff_overlay_version = RUNOFF_OVERLAY_VERSION
-                    st.session_state.dem_crop_error = None
                     st.session_state.dem_partial_coverage = runoff["partial_coverage"]
-                except DemCoverageError as coverage_error:
+                else:
                     st.session_state.pop("runoff_overlay", None)
                     st.session_state.pop("runoff_overlay_bounds", None)
-                    st.session_state.dem_crop_error = str(coverage_error)
+                st.session_state.dem_crop_error = analysis["errors"]["runoff"]
+
+                # Gate del selector del sidebar: la opción "flow" solo existe si
+                # esta iteración realmente produjo celdas con flow_value.
+                st.session_state.flow_variable_available = analysis["has_flow_variable"]
 
         # Crear una nueva instancia es necesario porque st_folium procesa el mapa
         # al renderizarlo. Se conserva el estado aleatorio para que la capa de ríos
@@ -541,27 +891,32 @@ def main():
         ).add_to(cuenca_map)
 
         # La capa dinámica se inserta sin cambiar el script base del mapa.
-        st_folium(
-            cuenca_map,
-            width=1200,
-            height=600,
-            key="folium_map_component",
-            returned_objects=["last_active_drawing"],
-            feature_group_to_add=runoff_feature_group,
-        )
+        # Va dentro de map_container (reservado arriba) para que el iframe
+        # conserve siempre la misma posición en el árbol de elementos.
+        with map_container:
+            st_folium(
+                cuenca_map,
+                width=1200,
+                height=600,
+                key="folium_map_component",
+                returned_objects=["last_active_drawing"],
+                feature_group_to_add=runoff_feature_group,
+            )
 
-        if last_drawing:
-            if st.session_state.get("dem_crop_error"):
-                st.warning(st.session_state.dem_crop_error)
-            else:
-                st.success("Riesgo de escorrentía calculado exitosamente")
-                if st.session_state.get("dem_partial_coverage"):
-                    st.warning(
-                        "Parte del polígono cae fuera del DEM provincial; "
-                        "el análisis cubre solo el área con datos."
-                    )
-                st.caption(
-                    "Cian: píxeles del percentil 95 o superior de acumulación de flujo."
+        # Resultados del análisis unificado del polígono, todos provenientes de
+        # la MISMA llamada a run_polygon_analysis(): estado por paso, caudal
+        # estimado y panel 3D, en ese orden y sin que el usuario tenga que
+        # accionar nada entre uno y otro.
+        analysis = st.session_state.get("polygon_analysis") if last_drawing else None
+        if analysis:
+            # Cada sección va a su slot reservado: los mensajes de estado varían
+            # en cantidad según qué pasos fallaron, y sin slots fijos esa
+            # variación correría la posición del iframe del panel 3D.
+            with analysis_results_container:
+                render_analysis_status(analysis)
+            with panel_3d_container:
+                render_polygon_3d_panel(
+                    analysis["grid_3d"], controls.get("cross_height_var", "precip")
                 )
 
         # Panel 3D: reacciona al mismo selectbox de capa climática que la capa 2D de arriba,
@@ -591,78 +946,58 @@ def main():
                 else:
                     st.info("No hay datos climáticos disponibles para la vista 3D.")
 
-        # Panel 3D combinado: cruza precipitación (CHIRPS) y temperatura (ERA5-Land)
-        # en una sola grilla vía align_climate_grids(), independiente del selector
-        # de "Capa Climática" de arriba — siempre descarga/cachea ambas fuentes
-        # (Promedio lluvias + Temperatura promedio) cuando el checkbox está activo.
-        if controls.get("enable_climate_cross"):
+        # Cruce 3D provincial (precipitación x temperatura), SIN polígono dibujado.
+        # Cuando sí hay un polígono, el panel 3D ya se renderiza arriba con la
+        # grilla de esa iteración (incluida la acumulación de flujo), así que
+        # este bloque se omite para no mostrar dos paneles con la misma variable.
+        if controls.get("enable_climate_cross") and not analysis:
             with st.expander("🧊 Cruce 3D - Precipitación x Temperatura", expanded=True):
                 gdf_combined_climate = None
                 try:
-                    precip_cross_config = CLIMATE_LAYER_CONFIG["Promedio lluvias"]
-                    temp_cross_config = CLIMATE_LAYER_CONFIG["Temperatura promedio 2016-2026"]
-
-                    # Reusa el mismo caché en disco que las capas individuales de
-                    # arriba: si "Promedio lluvias" o "Temperatura promedio" ya se
-                    # pidieron en esta sesión (o en una anterior), esto no vuelve a
-                    # llamar a Earth Engine.
-                    precip_raster_path = fetch_and_cache_chirps(
-                        geojson_path=CUENCA_GEOJSON_PATH,
-                        start_date=precip_cross_config["start_date"],
-                        end_date=precip_cross_config["end_date"],
-                        aggregation=precip_cross_config["aggregation"],
-                    )
-                    temp_raster_path = fetch_and_cache_era5_temperature(
-                        geojson_path=CUENCA_GEOJSON_PATH,
-                        start_date=temp_cross_config["start_date"],
-                        end_date=temp_cross_config["end_date"],
-                        aggregation=temp_cross_config["aggregation"],
-                    )
-                    gdf_combined_climate = align_climate_grids(precip_raster_path, temp_raster_path)
+                    # La MISMA lectura cacheada que usa el análisis del polígono
+                    # (load_combined_climate_grid), no una carga paralela.
+                    gdf_combined_climate = load_combined_climate_grid()
                 except EarthEngineError as ee_error:
                     st.error(f"⚠️ No se pudo obtener precipitación/temperatura de Earth Engine: {ee_error}")
                 except Exception as processing_error:
                     st.error(f"❌ Error inesperado alineando las grillas climáticas: {processing_error}")
 
                 if gdf_combined_climate is not None and not gdf_combined_climate.empty:
-                    # cross_height_var decide qué columna maneja la altura; la otra
-                    # queda para el color. Cada una con su propia etiqueta/unidad/
-                    # esquema de color, igual que sus capas individuales de arriba.
-                    if controls.get("cross_height_var") == "Temperatura":
-                        height_column, height_label, height_unit = "temp_value", "Temperatura", "°C"
-                        color_column, color_label, color_unit, color_scheme = (
-                            "precip_value", "Precipitación", "mm", "average",
+                    # Sin polígono no existe la variable "flow", así que el
+                    # selector del sidebar solo ofrece precip/temp acá.
+                    cross_height_var = controls.get("cross_height_var", "precip")
+                    layer_spec = build_pydeck_layer(gdf_combined_climate, cross_height_var)
+
+                    if layer_spec is None:
+                        st.info(
+                            "La variable seleccionada no tiene datos en la grilla provincial. "
+                            "Dibujá un polígono para habilitar la acumulación de flujo."
                         )
                     else:
-                        height_column, height_label, height_unit = "precip_value", "Precipitación", "mm"
-                        color_column, color_label, color_unit, color_scheme = (
-                            "temp_value", "Temperatura", "°C", "temperature",
+                        cross_basemap = st.selectbox(
+                            "Mapa base",
+                            options=list(BASEMAP_TILE_URLS.keys()),
+                            index=list(BASEMAP_TILE_URLS.keys()).index(DEFAULT_BASEMAP),
+                            help="Mapa base de CARTO dibujado debajo de las columnas 3D.",
+                            key="cross_basemap_select",
                         )
-
-                    cross_colormap = build_colormap(
-                        gdf_combined_climate, color_column, color_scheme,
-                        caption=f"{color_label} ({color_unit})",
-                    )
-                    cross_basemap = st.selectbox(
-                        "Mapa base",
-                        options=list(BASEMAP_TILE_URLS.keys()),
-                        index=list(BASEMAP_TILE_URLS.keys()).index(DEFAULT_BASEMAP),
-                        help="Mapa base de CARTO dibujado debajo de las columnas 3D.",
-                        key="cross_basemap_select",
-                    )
-                    cross_df_3d = gdf_to_pydeck_df_dual(
-                        gdf_combined_climate, height_column, color_column, cross_colormap
-                    )
-                    cross_view_state = build_isometric_view_state(gdf_combined_climate)
-                    render_3d_panel_live(
-                        cross_df_3d, cross_view_state, basemap=cross_basemap,
-                        tooltip_label=height_label, unit=height_unit,
-                        color_tooltip_label=color_label, color_unit=color_unit,
-                    )
-                    st.caption(
-                        f"Altura de columnas: {height_label} ({height_unit}) · "
-                        f"Color de columnas: {color_label} ({color_unit})."
-                    )
+                        render_3d_panel_live(
+                            layer_spec.df, layer_spec.view_state, basemap=cross_basemap,
+                            tooltip_label=layer_spec.height_label,
+                            unit=layer_spec.height_unit,
+                            color_tooltip_label=layer_spec.color_label,
+                            color_unit=layer_spec.color_unit,
+                            elevation_scale=layer_spec.elevation_scale,
+                        )
+                        st.caption(
+                            f"Altura de columnas: {layer_spec.height_label} "
+                            f"({layer_spec.height_unit})"
+                            if layer_spec.is_single_variable else
+                            f"Altura de columnas: {layer_spec.height_label} "
+                            f"({layer_spec.height_unit}) · "
+                            f"Color de columnas: {layer_spec.color_label} "
+                            f"({layer_spec.color_unit})."
+                        )
                 elif gdf_combined_climate is not None:
                     st.info(
                         "No hay celdas con precipitación y temperatura válidas simultáneamente "

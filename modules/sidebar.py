@@ -1,5 +1,8 @@
 import streamlit as st
 
+from modules.pydeck_layers import height_variable_options
+
+
 def render_sidebar():
     """
     Renderiza el menú lateral (Sidebar) con títulos, filtros y controles de capas.
@@ -46,22 +49,47 @@ def render_sidebar():
 
         st.markdown("---")
 
-        st.subheader("🧊 Cruce 3D Precipitación x Temperatura")
+        st.subheader("🧊 Panel 3D")
+
+        # A drawn polygon renders the 3D panel on its own (see the polygon
+        # analysis section in app.py), so the selector below has to stay usable
+        # in that case too — gating it on this checkbox alone used to leave the
+        # panel stuck on "Precipitación" with no way to switch variables.
+        polygon_panel_active = st.session_state.get("polygon_analysis") is not None
+
         enable_climate_cross = st.checkbox(
-            "Cruzar precipitación y temperatura en el panel 3D",
+            "Mostrar el panel 3D sin polígono dibujado",
             value=False,
-            help="Descarga precipitación (CHIRPS) y temperatura (ERA5-Land) para el mismo "
-                 "período, las alinea celda a celda (ver align_climate_grids) y las cruza en "
-                 "un panel 3D aparte: una variable define la altura de las columnas y la otra "
-                 "su color. Independiente del selector de 'Capa Climática' de arriba.",
+            help="Cruza precipitación (CHIRPS) y temperatura (ERA5-Land) sobre toda la "
+                 "provincia en un panel 3D: una variable define la altura de las columnas "
+                 "y la otra su color. Si ya dibujaste un polígono, el panel aparece igual "
+                 "debajo del mapa y este checkbox no hace falta.",
         )
-        cross_height_var = st.selectbox(
+
+        # "Acumulación de flujo (riesgo)" only appears once the unified polygon
+        # analysis has actually produced cells with a flow_value (see
+        # `run_polygon_analysis` in app.py, which sets this flag). Without that
+        # check the option would be selectable with nothing behind it — Pysheds
+        # runs on-the-fly per drawn polygon, there's no province-wide flow
+        # accumulation to fall back on.
+        height_var_options = height_variable_options(
+            include_flow=st.session_state.get("flow_variable_available", False)
+        )
+
+        selected_height_label = st.selectbox(
             "Variable → Altura de columnas",
-            options=["Precipitación", "Temperatura"],
+            options=list(height_var_options),
             index=0,
-            disabled=not enable_climate_cross,
-            help="La otra variable define el color de las columnas.",
+            disabled=not (enable_climate_cross or polygon_panel_active),
+            help="Precipitación y Temperatura se cruzan entre sí: la elegida define la "
+                 "altura de las columnas y la otra su color. 'Acumulación de flujo' usa "
+                 "una sola variable (altura y color) y solo aparece si ya se dibujó un "
+                 "polígono y corrió el análisis de Pysheds.",
         )
+        # Returned as the stable "precip"/"temp"/"flow" key rather than the
+        # display label, so app.py can hand it straight to build_pydeck_layer()
+        # without re-matching translated strings.
+        cross_height_var = height_var_options[selected_height_label]
 
         st.markdown("---")
 

@@ -4,7 +4,6 @@ venv/
 .pytest_cache/
 /datos_ign
 /.streamlit/
-/modules
 /venv
 /AP
 /data/cache/
