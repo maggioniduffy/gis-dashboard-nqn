@@ -272,20 +272,32 @@ def render_analysis_status(analysis: dict) -> None:
 
     Un paso fallido nunca oculta a los que sí corrieron: se listan todos los
     errores y después se muestra lo que haya podido calcularse.
+
+    Presentación: el caudal es EL resultado del tablero, así que va como
+    número display en mono sobre el verde profundo del acento, con la
+    descomposición de la fórmula a su derecha separada por una regla — se
+    lee "cuánto" y "de dónde sale" en un solo golpe de vista, en vez de un
+    st.metric chico al lado de un st.caption corrido.
     """
     for step, label in ANALYSIS_STEP_LABELS.items():
         error_message = analysis["errors"][step]
         if error_message:
-            st.warning(f"⚠️ {label}: {error_message}")
+            st.warning(f"{label}: {error_message}")
 
     if "runoff" in analysis["completed"]:
-        st.success("Riesgo de escorrentía calculado exitosamente")
+        st.markdown(
+            '<div class="status-ok"><div class="status-ok-dot"></div><div>'
+            '<div class="status-ok-title">Riesgo de escorrentía calculado exitosamente</div>'
+            '<div class="status-ok-sub">Cian: píxeles del percentil 95 o superior '
+            'de acumulación de flujo.</div>'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
         if analysis["runoff"]["partial_coverage"]:
             st.warning(
                 "Parte del polígono cae fuera del DEM provincial; "
                 "el análisis cubre solo el área con datos."
             )
-        st.caption("Cian: píxeles del percentil 95 o superior de acumulación de flujo.")
 
     # El "I" de este caudal sale de la misma grilla climática que alimenta el
     # panel 3D (ver load_combined_climate_grid), no de una lectura aparte.
@@ -293,24 +305,53 @@ def render_analysis_status(analysis: dict) -> None:
     if not peak_flow_result:
         return
 
-    metric_col, breakdown_col = st.columns([1, 2])
-    with metric_col:
-        st.metric(
-            "Caudal pico estimado (Método Racional)",
-            f"{peak_flow_result['Q_m3_s']:.2f} m³/s",
+    st.markdown("<div style='height:0.65rem'></div>", unsafe_allow_html=True)
+
+    c_note = (
+        ' <span class="muted">(default, estepa / suelo natural)</span>'
+        if peak_flow_result["C_is_default"]
+        else ""
+    )
+    st.markdown(
+        f"""
+        <div class="flow-panel">
+          <div style="display:flex;flex-wrap:wrap;gap:26px;">
+            <div>
+              <div class="flow-label">Caudal pico estimado (Método Racional)</div>
+              <div style="display:flex;align-items:baseline;">
+                <span class="flow-value">{peak_flow_result['Q_m3_s']:.2f}</span>
+                <span class="flow-unit">m³/s</span>
+              </div>
+            </div>
+            <div style="flex:1 1 280px;min-width:0;border-left:1px solid var(--line);
+                        padding-left:24px;display:flex;flex-direction:column;
+                        justify-content:center;">
+              <div class="flow-formula">Q = C × I × A / 360</div>
+              <div class="flow-terms">
+                C = {peak_flow_result['C']:.2f}{c_note}<br/>
+                I = {peak_flow_result['I_mm_h']:.2f} mm/h
+                  <span class="muted">(CHIRPS, promedio histórico)</span><br/>
+                A = {peak_flow_result['A_km2']:.2f} km²
+              </div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not peak_flow_result["method_valid_for_basin_size"]:
+        # Acotación al resultado, no alarma: barra lateral color estepa en
+        # vez del banner amarillo de st.warning, que a esta altura de la
+        # página competía con el número que acaba de calcularse.
+        st.markdown(
+            '<div class="method-note">'
+            '<div class="method-note-title">Nota metodológica</div>'
+            '<div class="method-note-body">El área dibujada supera ~2.5 km²: '
+            'el Método Racional está pensado para cuencas pequeñas y este valor '
+            'es solo orientativo.</div></div>',
+            unsafe_allow_html=True,
         )
-    with breakdown_col:
-        st.caption(
-            f"Q = C × I × A / 360 · C = {peak_flow_result['C']:.2f}"
-            f"{' (default, estepa/suelo natural)' if peak_flow_result['C_is_default'] else ''}"
-            f" · I = {peak_flow_result['I_mm_h']:.2f} mm/h (CHIRPS, prom. histórico)"
-            f" · A = {peak_flow_result['A_km2']:.2f} km²"
-        )
-        if not peak_flow_result["method_valid_for_basin_size"]:
-            st.warning(
-                "El área dibujada supera ~2.5 km²: el Método Racional está "
-                "pensado para cuencas pequeñas y este valor es solo orientativo."
-            )
 
 
 def render_polygon_3d_panel(analysis_grid, height_variable: str) -> None:
@@ -325,7 +366,7 @@ def render_polygon_3d_panel(analysis_grid, height_variable: str) -> None:
     if analysis_grid is None or analysis_grid.empty:
         return
 
-    with st.expander("🧊 Panel 3D (PyDeck)", expanded=True):
+    with st.expander("Panel 3D (PyDeck)", expanded=True):
         layer_spec = build_pydeck_layer(analysis_grid, height_variable)
         if layer_spec is None:
             st.info(
@@ -381,15 +422,27 @@ def render_dem_panel():
     """
     with st.sidebar:
         st.markdown("---")
-        st.subheader("⛰️ DEM Provincial")
+        st.subheader("DEM provincial")
         status = get_provincial_dem_status()
         pending_task = status["pending_task"]
 
+        # Estado como pastilla de una línea con punto de color (musgo = hay
+        # DEM, estepa = no hay), en vez de st.success/st.warning: en una
+        # columna angosta los banners nativos ocupaban tres líneas y teñían
+        # de alarma un estado que casi siempre es normal.
         if status["cached"]:
             source_txt = f" · {status['source']}" if status["source"] else ""
-            st.success(f"DEM cacheado ({_format_local_time(status['cached_at'])}{source_txt})")
+            st.markdown(
+                '<div class="dem-status dem-ok"><div class="dot"></div>'
+                f'DEM cacheado — {_format_local_time(status["cached_at"])}{source_txt}</div>',
+                unsafe_allow_html=True,
+            )
         else:
-            st.warning("No hay DEM provincial cacheado: el análisis de escorrentía no está disponible.")
+            st.markdown(
+                '<div class="dem-status dem-warn"><div class="dot"></div>'
+                'Sin DEM cacheado: el análisis de escorrentía no está disponible.</div>',
+                unsafe_allow_html=True,
+            )
 
         if pending_task:
             st.info(
@@ -401,7 +454,7 @@ def render_dem_panel():
                     with st.spinner("Consultando el estado del export en Earth Engine..."):
                         result = check_provincial_dem_export()
                 except EarthEngineError as ee_error:
-                    st.error(f"⚠️ {ee_error}")
+                    st.error(f"{ee_error}")
                 else:
                     if result["state"] == "COMPLETED":
                         st.rerun()
@@ -422,7 +475,7 @@ def render_dem_panel():
                         update_provincial_dem(source=source, force=force)
                 except EarthEngineError as ee_error:
                     fallback_txt = " Se sigue usando el último DEM cacheado." if status["cached"] else ""
-                    st.error(f"⚠️ {ee_error}{fallback_txt}")
+                    st.error(f"{ee_error}{fallback_txt}")
                 else:
                     st.rerun()
 
@@ -469,124 +522,377 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 2. Estilos CSS: tema claro/técnico. La tipografía serif (Source Serif 4,
-# estilo Claude) se define a nivel de tema en .streamlit/config.toml
-# (theme.font / theme.headingFont), que es lo que realmente llega a todos
-# los widgets nativos de Streamlit (botones, inputs, tablas, sidebar) — el
-# CSS inyectado acá solo alcanza el contenedor principal, por eso se
-# mantiene como refuerzo/fallback. JetBrains Mono se reserva para lecturas
-# numéricas/técnicas (KPIs, chips de metadata); el contraste entre ambas
-# tipografías es lo que le da el aspecto de instrumento técnico en vez de
-# una página de texto plano.
+# 2. Estilos CSS. La tipografía y los colores base viven en
+# .streamlit/config.toml (es lo único que alcanza a los widgets nativos);
+# acá van (a) los tokens del design system como custom properties, para que
+# el HTML propio de KPIs/header/paneles los use por nombre, y (b) los
+# ajustes sobre el chrome de Streamlit que el tema no expone.
+#
+# Dos reglas del diseño que explican casi todo lo de abajo:
+#   · Sin sombras. La jerarquía se construye con bordes de 1px y con el
+#     contraste papel/superficie, no con elevación.
+#   · Serif SOLO en títulos. El resto es sans; los números son mono.
 st.markdown("""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600;8..60,700&family=JetBrains+Mono:wght@400;600;700&display=swap');
-
-    html, body, [class*="css"], .stApp, .stApp * {
-        font-family: 'Source Serif 4', Georgia, 'Times New Roman', serif;
+    :root {
+      --ink:#1a2420;
+      --ink-soft:#4c5a52;
+      --ink-faint:#8a9690;
+      --paper:#eef1ea;
+      --surface:#f9faf7;
+      --surface-sunken:#e4e8e0;
+      --line:#d6dbd0;
+      --line-strong:#c3cabb;
+      --river:#0d6e74;
+      --river-deep:#0a4f54;
+      --river-tint:#e2f0ef;
+      --steppe:#9c6a2e;
+      --steppe-tint:#f3e9d9;
+      --moss:#4a6b45;
+      --moss-tint:#e8eee3;
+      --brick:#a8402e;
+      --brick-tint:#f8e7e1;
+      --font-serif:'Source Serif 4',Georgia,serif;
+      --font-sans:'IBM Plex Sans',system-ui,sans-serif;
+      --font-mono:'IBM Plex Mono','SFMono-Regular',monospace;
     }
 
-    /* La regla de arriba (`.stApp *`) también le pisa la tipografía a los
-       íconos de Material que Streamlit renderiza como ligaduras (la flecha
-       de los expanders, el ojo de los inputs de contraseña, etc.): sin la
-       fuente de íconos, el navegador muestra el nombre literal de la
-       ligadura ("keyboard_double_arrow_right") en vez del glifo. Se
-       restaura la fuente de íconos solo para esos elementos. */
-    [data-testid="stIconMaterial"] {
+    .stApp { -webkit-font-smoothing:antialiased; }
+
+    /* Streamlit dibuja sus íconos (la flecha de los expanders, el ojo de los
+       inputs, el "?" de los help) como LIGADURAS de Material Symbols: el
+       elemento contiene el texto literal "keyboard_arrow_right" y es la
+       fuente la que lo convierte en glifo. Cualquier font-family que le
+       gane a esos spans deja el nombre de la ligadura a la vista encima de
+       la etiqueta. Se les blinda la fuente de íconos. */
+    [data-testid="stIconMaterial"],
+    div[data-testid="stExpander"] summary span[data-testid="stIconMaterial"],
+    .material-symbols-rounded {
         font-family: 'Material Symbols Rounded' !important;
     }
 
-    .main .block-container {
-        padding-top: 1.75rem;
-        padding-bottom: 2.5rem;
-        max-width: 1320px;
+    .block-container {
+        padding-top: 1.9rem;
+        padding-bottom: 3.75rem;
+        max-width: 1240px;
     }
 
-    /* Encabezado: título + bajada + fila de chips de metadata técnica
-       (fuentes de datos, CRS, proyecto de Earth Engine). */
+    /* Los títulos de sección (st.subheader) son el único serif fuera del
+       h1 del header: es lo que le da el tono editorial al dashboard sin
+       ensuciar la legibilidad de los controles. */
+    .stApp h1, .stApp h2, .stApp h3,
+    section[data-testid="stSidebar"] h1 {
+        font-family: var(--font-serif);
+        letter-spacing: -0.01em;
+        color: var(--ink);
+    }
+    .stApp h3 { font-size: 1rem; font-weight: 600; }
+
+    /* ---------- Header: título, bajada, coordenadas, chips ---------- */
     .app-header h1 {
-        font-size: 1.85rem;
-        font-weight: 700;
-        letter-spacing: -0.02em;
-        margin: 0 0 0.3rem 0;
+        font-family: var(--font-serif);
+        font-size: 1.7rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        margin: 0 0 0.5rem 0;
+        color: var(--ink);
     }
     .app-subtitle {
-        color: #5b6b7a;
-        font-size: 0.95rem;
-        max-width: 800px;
-        line-height: 1.55;
-        margin-bottom: 0.6rem;
+        font-family: var(--font-sans);
+        color: var(--ink-soft);
+        font-size: 0.875rem;
+        line-height: 1.6;
+        max-width: 720px;
+        margin: 0 0 0.375rem 0;
+    }
+    /* Ancla geográfica: dice de qué lugar del mundo habla el tablero antes
+       de que el mapa termine de cargar. */
+    .app-coords {
+        font-family: var(--font-mono);
+        font-size: 0.69rem;
+        color: var(--ink-faint);
+        margin-bottom: 0.75rem;
     }
     .app-meta-row {
         display: flex;
         flex-wrap: wrap;
-        gap: 8px;
-        margin-bottom: 1.1rem;
+        gap: 7px;
+        margin-bottom: 1.25rem;
     }
+    /* Chips rectangulares y mudos (antes eran píldoras teal): son metadata
+       de referencia, no llamadas a la acción, y no deben competir con los
+       KPIs por atención. */
     .tech-chip {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.72rem;
-        font-weight: 600;
+        font-family: var(--font-mono);
+        font-size: 0.655rem;
+        font-weight: 500;
         letter-spacing: 0.02em;
-        color: #0f766e;
-        background: #e6f4f2;
-        border: 1px solid #bfe4df;
-        border-radius: 999px;
-        padding: 3px 11px;
+        color: var(--ink-soft);
+        background: var(--surface-sunken);
+        border: 1px solid var(--line-strong);
+        border-radius: 3px;
+        padding: 4px 9px;
         white-space: nowrap;
     }
 
-    /* Tarjetas KPI: valor en monospace (lectura tipo instrumento), etiqueta
-       muda en versalitas pequeñas. */
+    /* ---------- Tarjetas KPI ---------- */
+    /* Etiqueta arriba en sans chico, valor en mono. El valor va en --ink y
+       no en el acento: cuatro números teal en fila se leen como cuatro
+       botones. El acento queda reservado para el caudal pico. */
     .metric-card {
-        background-color: #ffffff;
-        border: 1px solid #e3e8ec;
-        border-radius: 12px;
-        padding: 14px 18px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 14px 16px;
         height: 100%;
-        box-shadow: 0 1px 3px rgba(15, 23, 30, 0.06);
     }
     .metric-card h4 {
-        margin: 0;
-        color: #5b6b7a;
-        font-size: 0.7rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.07em;
+        margin: 0 0 6px 0;
+        font-family: var(--font-sans);
+        color: var(--ink-soft);
+        font-size: 0.69rem;
+        font-weight: 400;
+        text-transform: none;
+        letter-spacing: 0;
     }
     .metric-card p {
-        margin: 5px 0 0 0;
-        color: #0f766e;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 1.35rem;
-        font-weight: 700;
+        margin: 0;
+        color: var(--ink);
+        font-family: var(--font-mono);
+        font-size: 1.375rem;
+        font-weight: 600;
         line-height: 1.2;
     }
-    .metric-card small {
-        display: block;
-        margin-top: 2px;
-        color: #8c98a4;
-        font-size: 0.72rem;
-        font-family: 'JetBrains Mono', monospace;
+    .metric-card p .unit {
+        font-size: 0.69rem;
+        color: var(--ink-faint);
+        font-weight: 500;
+        margin-left: 2px;
     }
 
-    /* Expanders con el mismo tratamiento de tarjeta que los KPIs, para que
-       los paneles 3D/tablas se sientan parte del mismo sistema visual. */
+    /* ---------- Bloque de caudal pico ---------- */
+    /* El número grande es el resultado del tablero: tipografía display en
+       mono, en el verde profundo del acento, con la fórmula al lado
+       separada por una regla vertical para que se lea "valor · cómo". */
+    .flow-panel {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 20px 22px;
+    }
+    .flow-label {
+        font-family: var(--font-sans);
+        font-size: 0.72rem;
+        color: var(--ink-soft);
+        margin-bottom: 8px;
+    }
+    .flow-value {
+        font-family: var(--font-mono);
+        font-weight: 700;
+        font-size: 3.25rem;
+        line-height: 1;
+        color: var(--river-deep);
+        letter-spacing: -0.02em;
+    }
+    .flow-unit {
+        font-family: var(--font-mono);
+        font-weight: 600;
+        font-size: 1.1rem;
+        color: var(--ink-soft);
+        margin-left: 7px;
+    }
+    .flow-formula {
+        font-family: var(--font-mono);
+        font-size: 0.8rem;
+        color: var(--ink);
+        margin-bottom: 6px;
+    }
+    .flow-terms {
+        font-family: var(--font-sans);
+        font-size: 0.78rem;
+        color: var(--ink-soft);
+        line-height: 1.75;
+    }
+    .flow-terms .muted { color: var(--ink-faint); }
+
+    /* Nota metodológica: barra lateral color estepa en vez del banner
+       amarillo de st.warning. Es una acotación al resultado, no una alarma,
+       y encajonarla en un callout completo le daba más peso del que tiene. */
+    .method-note {
+        border-left: 3px solid var(--steppe);
+        background: var(--surface);
+        border-radius: 0 4px 4px 0;
+        padding: 12px 16px;
+        margin-top: 2px;
+    }
+    .method-note-title {
+        font-family: var(--font-sans);
+        font-size: 0.655rem;
+        font-weight: 600;
+        color: var(--steppe);
+        letter-spacing: 0.03em;
+        text-transform: uppercase;
+        margin-bottom: 4px;
+    }
+    .method-note-body {
+        font-family: var(--font-sans);
+        font-size: 0.81rem;
+        color: var(--ink);
+        line-height: 1.55;
+    }
+
+    /* Banner de éxito del análisis: musgo sobre musgo claro, sin borde. */
+    .status-ok {
+        display: flex;
+        gap: 10px;
+        align-items: flex-start;
+        background: var(--moss-tint);
+        border-radius: 4px;
+        padding: 12px 14px;
+    }
+    .status-ok-dot {
+        width: 15px; height: 15px;
+        border-radius: 50%;
+        background: var(--moss);
+        flex-shrink: 0;
+        margin-top: 2px;
+        position: relative;
+    }
+    .status-ok-dot::after {
+        content:"";
+        position:absolute; left:4px; top:3.5px;
+        width:4px; height:7px;
+        border:solid #fff; border-width:0 1.6px 1.6px 0;
+        transform: rotate(45deg);
+    }
+    .status-ok-title {
+        font-family: var(--font-sans);
+        font-size: 0.83rem; font-weight: 600; color: #2f4a2b;
+    }
+    .status-ok-sub {
+        font-family: var(--font-sans);
+        font-size: 0.75rem; color: #3f5a3a; margin-top: 3px;
+    }
+
+    /* ---------- Chrome de Streamlit ---------- */
+    /* Paneles (expanders) como tarjetas planas: mismo borde y radio que los
+       KPIs, sin sombra, con el encabezado en serif. */
     div[data-testid="stExpander"] {
-        border: 1px solid #e3e8ec;
-        border-radius: 12px;
-        box-shadow: 0 1px 3px rgba(15, 23, 30, 0.05);
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        box-shadow: none;
+    }
+    /* El :not() es obligatorio: la flecha del expander es un <span> hermano
+       del label, y ponerle serif lo deja mostrando el texto de la ligadura
+       ("keyboard_arrow_right") en vez del glifo. */
+    div[data-testid="stExpander"] summary p,
+    div[data-testid="stExpander"] summary span:not([data-testid="stIconMaterial"]) {
+        font-family: var(--font-serif) !important;
+        font-size: 0.94rem;
+        font-weight: 600;
+        color: var(--ink);
+    }
+    div[data-testid="stExpander"] details { border: none; }
+
+    /* Números de st.metric en mono, para que cualquier lectura numérica de
+       la app (propia o nativa) se vea igual. */
+    div[data-testid="stMetricValue"] {
+        font-family: var(--font-mono);
+        font-weight: 600;
+        color: var(--ink);
+    }
+    div[data-testid="stMetricLabel"] p {
+        font-size: 0.72rem;
+        color: var(--ink-soft);
+    }
+
+    /* Tabla de fuentes: encabezados en versalitas mudas, filas separadas
+       por líneas finas, monospace en los identificadores de dataset. */
+    .stApp table { border-collapse: collapse; width: 100%; font-size: 0.79rem; }
+    .stApp thead tr { border-bottom: 1.5px solid var(--line-strong); }
+    .stApp thead th {
+        font-family: var(--font-sans);
+        font-size: 0.655rem;
+        font-weight: 600;
+        color: var(--ink-soft);
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        text-align: left;
+        padding: 6px 10px;
+    }
+    .stApp tbody tr { border-bottom: 1px solid var(--line); }
+    .stApp tbody td { padding: 8px 10px; }
+    .stApp tbody td code {
+        font-family: var(--font-mono);
+        font-size: 0.72rem;
+        background: transparent;
+        color: var(--ink);
+        padding: 0;
     }
 
     hr {
-        margin: 0.9rem 0;
-        border-color: #e3e8ec !important;
+        margin: 0.85rem 0;
+        border: none;
+        border-top: 1px solid var(--line) !important;
     }
 
+    /* ---------- Sidebar ---------- */
+    section[data-testid="stSidebar"] { border-right: 1px solid var(--line); }
+    section[data-testid="stSidebar"] > div { padding-top: 1.6rem; }
+    /* Los encabezados de sección del sidebar NO son títulos editoriales:
+       son etiquetas de grupo. Sans, 12px, semibold — lo mismo que hace el
+       diseño, y lo que mantiene compacta una columna con muchos controles. */
     section[data-testid="stSidebar"] h3 {
-        font-size: 0.92rem;
-        letter-spacing: 0.01em;
+        font-family: var(--font-sans) !important;
+        font-size: 0.75rem !important;
+        font-weight: 600;
+        color: var(--ink);
+        letter-spacing: 0;
+        margin-bottom: 0.2rem;
     }
+    section[data-testid="stSidebar"] label p,
+    section[data-testid="stSidebar"] .stCheckbox label p {
+        font-size: 0.78rem;
+        color: var(--ink-soft);
+    }
+    section[data-testid="stSidebar"] div[data-testid="stMetricValue"] {
+        font-size: 1rem;
+    }
+    /* Marca del sidebar: logo de dos cauces + nombre en serif. */
+    .brand { display:flex; align-items:center; gap:10px; margin-bottom:2px; }
+    .brand-name {
+        font-family: var(--font-serif);
+        font-weight: 600; font-size: 1rem; line-height: 1.15; color: var(--ink);
+    }
+    .brand-sub {
+        font-family: var(--font-mono);
+        font-size: 0.655rem; color: var(--ink-faint);
+        letter-spacing: 0.02em; margin-top: 2px;
+    }
+    /* Tip y estado del DEM: cajas de una línea, sin el icono ni el fondo
+       saturado de st.info/st.success. */
+    .side-note {
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 11px 12px;
+        font-family: var(--font-sans);
+        font-size: 0.72rem;
+        color: var(--ink-soft);
+        line-height: 1.5;
+    }
+    .dem-status {
+        display: flex; align-items: center; gap: 8px;
+        padding: 8px 10px; border-radius: 3px;
+        font-family: var(--font-sans); font-size: 0.72rem;
+        line-height: 1.4;
+    }
+    .dem-status .dot { width:6px; height:6px; border-radius:50%; flex-shrink:0; }
+    .dem-ok    { background: var(--moss-tint);   color:#2f4a2b; }
+    .dem-ok    .dot { background: var(--moss); }
+    .dem-warn  { background: var(--steppe-tint); color:#6d4a1f; }
+    .dem-warn  .dot { background: var(--steppe); }
     </style>
 """, unsafe_allow_html=True)
 
@@ -601,13 +907,14 @@ def _render_header():
     st.markdown(
         f"""
         <div class="app-header">
-          <h1>🌊 Monitoreo Ambiental — Cuenca Neuquén</h1>
+          <h1>Monitoreo Ambiental — Cuenca Neuquén</h1>
           <div class="app-subtitle">
             Plataforma de visualización geoespacial e hidrológica: precipitación (CHIRPS) y
             temperatura (ERA5-Land) vía Google Earth Engine, análisis de escorrentía sobre DEM
             provincial, y capas vectoriales de cuerpos de agua, ríos y estaciones meteorológicas
             de la <strong>Cuenca del Neuquén</strong>.
           </div>
+          <div class="app-coords">Confluencia Limay–Neuquén · 38°57′S, 68°03′W</div>
           <div class="app-meta-row">
             <span class="tech-chip">GEE · {EE_PROJECT_ID}</span>
             <span class="tech-chip">CRS vis · EPSG:4326</span>
@@ -633,9 +940,9 @@ def main():
     area_km2, length_km = calculate_accurate_metrics()
     with st.sidebar:
         st.markdown("---")
-        st.subheader("📏 Métricas Espaciales (EPSG:5343)")
+        st.subheader("Métricas espaciales · EPSG:5343")
         st.metric(
-            label="Cuerpos de Agua",
+            label="Cuerpos de agua",
             value=f"{area_km2:,.2f} km²" if area_km2 is not None else "N/D",
         )
         st.metric(
@@ -652,50 +959,76 @@ def main():
         gdf_rios = load_additional_layer("rios_neuquen.geojson")
         gdf_puntos = load_additional_layer("puntos_neuquen.geojson")
 
-    # KPI row: mismas .metric-card definidas en el CSS de arriba, con datos
-    # reales en vez de placeholders — área/longitud recién calculadas, CRS
-    # nativo del GeoJSON cargado, y el filtro de estación activo.
+    # KPI row: las mismas .metric-card del CSS de arriba, con datos reales.
+    # El valor y su unidad se arman con un helper en vez de repetir el HTML
+    # cuatro veces: el caso "N/D" (área o longitud ilegibles) y el valor con
+    # unidad comparten marcado, así ninguna variante se queda atrás cuando
+    # cambia el diseño de la tarjeta.
     n_features = len(gdf_cuenca) if gdf_cuenca is not None else 0
     crs_name = str(gdf_cuenca.crs) if gdf_cuenca is not None and gdf_cuenca.crs else "N/D"
     filtro_txt = controls["selected_estacion"]
     if len(filtro_txt) > 24:
         filtro_txt = filtro_txt[:22] + "…"
 
-    kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
+    def _kpi(label: str, value: str, unit: str = "", value_size: str = "") -> str:
+        size = f' style="font-size:{value_size};"' if value_size else ""
+        unit_html = f'<span class="unit">{unit}</span>' if unit else ""
+        return (
+            f'<div class="metric-card"><h4>{label}</h4>'
+            f'<p{size}>{value}{unit_html}</p></div>'
+        )
+
+    kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4, gap="small")
     with kpi_col1:
         st.markdown(
-            '<div class="metric-card"><h4>Cuerpos de agua</h4>'
-            f'<p>{area_km2:,.1f}<small>km²</small></p></div>'
+            _kpi("Cuerpos de agua", f"{area_km2:,.1f}", "km²")
             if area_km2 is not None
-            else '<div class="metric-card"><h4>Cuerpos de agua</h4><p>N/D</p></div>',
+            else _kpi("Cuerpos de agua", "N/D"),
             unsafe_allow_html=True,
         )
     with kpi_col2:
         st.markdown(
-            '<div class="metric-card"><h4>Longitud de ríos</h4>'
-            f'<p>{length_km:,.1f}<small>km</small></p></div>'
+            _kpi("Longitud de ríos", f"{length_km:,.1f}", "km")
             if length_km is not None
-            else '<div class="metric-card"><h4>Longitud de ríos</h4><p>N/D</p></div>',
+            else _kpi("Longitud de ríos", "N/D"),
             unsafe_allow_html=True,
         )
     with kpi_col3:
         st.markdown(
-            f'<div class="metric-card"><h4>Geometrías de cuenca</h4>'
-            f'<p>{n_features}<small>{crs_name}</small></p></div>',
+            _kpi("Geometrías de cuenca", f"{n_features:,}", crs_name),
             unsafe_allow_html=True,
         )
     with kpi_col4:
         st.markdown(
-            f'<div class="metric-card"><h4>Filtro de estación</h4>'
-            f'<p style="font-size:1rem;">{filtro_txt}</p></div>',
+            _kpi("Filtro de estación", filtro_txt, value_size="0.94rem"),
             unsafe_allow_html=True,
         )
 
-    st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:0.9rem'></div>", unsafe_allow_html=True)
 
     # Renderizado del mapa interactivo con streamlit-folium
     if gdf_cuenca is not None and not gdf_cuenca.empty:
-        st.subheader("📍 Mapa Interactivo")
+        # Encabezado del mapa con la metadata viva a la derecha (estaciones
+        # dibujadas y capas encendidas): son dos números que el usuario ya
+        # controla desde el sidebar, y tenerlos acá evita tener que volver a
+        # mirarlo para saber qué está viendo. Es UN elemento fijo, igual que
+        # el st.subheader que reemplaza, así que no corre la posición de los
+        # slots reservados más abajo.
+        n_estaciones = len(gdf_puntos) if gdf_puntos is not None else 0
+        n_capas_activas = sum(
+            bool(controls[k])
+            for k in ("show_cuenca", "show_rios", "show_lagos", "show_stations")
+        )
+        st.markdown(
+            '<div style="display:flex;align-items:baseline;justify-content:space-between;'
+            'flex-wrap:wrap;gap:8px;margin-bottom:0.5rem;">'
+            '<div style="font-family:var(--font-serif);font-weight:600;font-size:1rem;'
+            'color:var(--ink);">Mapa interactivo</div>'
+            '<div style="font-family:var(--font-mono);font-size:0.69rem;color:var(--ink-faint);">'
+            f'{n_estaciones} estaciones · {n_capas_activas} capas activas</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
         # Slots FIJOS para los dos iframes de la página (el mapa de Folium y el
         # panel 3D de deck.gl), reservados acá arriba antes de cualquier trabajo
@@ -859,9 +1192,9 @@ def main():
                     )
                 gdf_climate = raster_to_classified_gdf(raster_path, n_bins=8, method="quantile")
             except EarthEngineError as ee_error:
-                st.error(f"⚠️ No se pudo obtener la capa climática de Earth Engine: {ee_error}")
+                st.error(f"No se pudo obtener la capa climática de Earth Engine: {ee_error}")
             except Exception as processing_error:
-                st.error(f"❌ Error inesperado procesando la capa climática: {processing_error}")
+                st.error(f"Error inesperado procesando la capa climática: {processing_error}")
 
             if gdf_climate is not None and not gdf_climate.empty:
                 climate_colormap = add_climate_layer_to_map(
@@ -873,7 +1206,7 @@ def main():
                     tooltip_label=f"{climate_config['value_label']} ({climate_config['unit']}):",
                 )
             elif gdf_climate is not None:
-                st.warning(f"⚠️ La capa climática '{selected_climate_layer}' no generó datos vectorizables.")
+                st.warning(f"La capa climática '{selected_climate_layer}' no generó datos vectorizables.")
 
         # Permitir seleccionar un área de recorte, limitando el dibujo a polígonos y rectángulos.
         # Mostrar el límite del DEM para guiar la selección de un área con solapamiento.
@@ -952,12 +1285,37 @@ def main():
         # estimado y panel 3D, en ese orden y sin que el usuario tenga que
         # accionar nada entre uno y otro.
         analysis = st.session_state.get("polygon_analysis") if last_drawing else None
-        if analysis:
-            # Cada sección va a su slot reservado: los mensajes de estado varían
-            # en cantidad según qué pasos fallaron, y sin slots fijos esa
-            # variación correría la posición del iframe del panel 3D.
-            with analysis_results_container:
+
+        # Cada sección va a su slot reservado: los mensajes de estado varían
+        # en cantidad según qué pasos fallaron, y sin slots fijos esa
+        # variación correría la posición del iframe del panel 3D.
+        #
+        # El título de la sección y el estado vacío se escriben SIEMPRE, no
+        # solo cuando hay análisis: sin polígono dibujado el usuario veía una
+        # página que terminaba en el mapa, sin nada que le dijera que ahí
+        # abajo va a aparecer un resultado ni qué tiene que hacer para
+        # provocarlo. Van dentro del container reservado, así que no corren
+        # la posición de ningún iframe.
+        with analysis_results_container:
+            st.markdown(
+                '<div style="font-family:var(--font-serif);font-weight:600;'
+                'font-size:1rem;color:var(--ink);margin:0.4rem 0 0.7rem;">'
+                'Resultado del análisis</div>',
+                unsafe_allow_html=True,
+            )
+            if analysis:
                 render_analysis_status(analysis)
+            else:
+                st.markdown(
+                    '<div style="border:1px dashed var(--line-strong);border-radius:4px;'
+                    'padding:20px;text-align:center;font-family:var(--font-sans);'
+                    'font-size:0.81rem;color:var(--ink-faint);">'
+                    'Dibujá un polígono en el mapa para calcular el caudal pico '
+                    'y el riesgo de escorrentía.</div>',
+                    unsafe_allow_html=True,
+                )
+
+        if analysis:
             with panel_3d_container:
                 render_polygon_3d_panel(
                     analysis["grid_3d"], controls.get("cross_height_var", "precip")
@@ -967,7 +1325,7 @@ def main():
         # reutilizando el mismo GeoDataFrame clasificado y el mismo colormap (sin duplicar
         # la descarga/clasificación de datos, ni volver a llamar a Earth Engine).
         if selected_climate_layer != "Ninguna":
-            with st.expander(f"🧊 Vista 3D - {selected_climate_layer} (PyDeck)", expanded=True):
+            with st.expander(f"Vista 3D — {selected_climate_layer} (PyDeck)", expanded=True):
                 if gdf_climate is not None and not gdf_climate.empty and climate_colormap is not None:
                     # Rotación, inclinación y escala de elevación viven como sliders HTML
                     # DENTRO del panel embebido (ver render_3d_panel_live): moverlos actualiza
@@ -995,16 +1353,16 @@ def main():
         # grilla de esa iteración (incluida la acumulación de flujo), así que
         # este bloque se omite para no mostrar dos paneles con la misma variable.
         if controls.get("enable_climate_cross") and not analysis:
-            with st.expander("🧊 Cruce 3D - Precipitación x Temperatura", expanded=True):
+            with st.expander("Cruce 3D — Precipitación × Temperatura", expanded=True):
                 gdf_combined_climate = None
                 try:
                     # La MISMA lectura cacheada que usa el análisis del polígono
                     # (load_combined_climate_grid), no una carga paralela.
                     gdf_combined_climate = load_combined_climate_grid()
                 except EarthEngineError as ee_error:
-                    st.error(f"⚠️ No se pudo obtener precipitación/temperatura de Earth Engine: {ee_error}")
+                    st.error(f"No se pudo obtener precipitación/temperatura de Earth Engine: {ee_error}")
                 except Exception as processing_error:
-                    st.error(f"❌ Error inesperado alineando las grillas climáticas: {processing_error}")
+                    st.error(f"Error inesperado alineando las grillas climáticas: {processing_error}")
 
                 if gdf_combined_climate is not None and not gdf_combined_climate.empty:
                     # Sin polígono no existe la variable "flow", así que el
@@ -1047,13 +1405,13 @@ def main():
                     )
 
         # Tabla de atributos expandible
-        with st.expander("📄 Ver Atributos de los Polígonos de la Cuenca"):
+        with st.expander("Ver atributos de los polígonos de la cuenca"):
             df_display = gdf_cuenca.drop(columns=["geometry"], errors="ignore")
             st.dataframe(df_display, use_container_width=True)
 
         # Ficha técnica: fuentes de datos, CRS y ubicación del caché — documenta
         # de dónde sale cada capa sin tener que leer el código fuente.
-        with st.expander("ℹ️ Fuentes de datos y metodología"):
+        with st.expander("Fuentes de datos y metodología"):
             st.markdown(
                 f"""
 | Capa | Fuente | Resolución nativa | Notas |
@@ -1079,7 +1437,7 @@ bilineal antes de vectorizar.
                 """
             )
     else:
-        st.info("💡 Asegúrese de colocar el archivo **cuenca_neuquen.geojson** en el directorio raíz de la aplicación para visualizar la cuenca.")
+        st.info("Colocá el archivo **cuenca_neuquen.geojson** en el directorio raíz de la aplicación para visualizar la cuenca.")
 
 
 

@@ -35,13 +35,13 @@ def load_cuenca_geojson(file_path: str = "cuenca_neuquen.geojson") -> gpd.GeoDat
     Maneja adecuadamente las excepciones de archivo no encontrado y errores de lectura.
     """
     if not os.path.exists(file_path):
-        st.error(f"⚠️ Error: No se encontró el archivo de cuenca en '{file_path}'. Por favor verifique la ubicación.")
+        st.error(f"Error: No se encontró el archivo de cuenca en '{file_path}'. Por favor verifique la ubicación.")
         return None
 
     try:
         gdf = gpd.read_file(file_path)
         if gdf.empty:
-            st.warning(f"⚠️ El archivo '{file_path}' está vacío.")
+            st.warning(f"El archivo '{file_path}' está vacío.")
             return None
 
         # Asegurar proyección EPSG:4326 para mapas web (Folium)
@@ -53,10 +53,10 @@ def load_cuenca_geojson(file_path: str = "cuenca_neuquen.geojson") -> gpd.GeoDat
 
         return gdf
     except FileNotFoundError:
-        st.error(f"⚠️ Error: No se pudo localizar el archivo '{file_path}'.")
+        st.error(f"Error: No se pudo localizar el archivo '{file_path}'.")
         return None
     except Exception as e:
-        st.error(f"❌ Ocurrió un error inesperado al leer '{file_path}': {e}")
+        st.error(f"Ocurrió un error inesperado al leer '{file_path}': {e}")
         return None
 
 @st.cache_data(show_spinner=False)
