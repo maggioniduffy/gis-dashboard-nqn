@@ -3,16 +3,38 @@ import streamlit as st
 from modules.pydeck_layers import height_variable_options
 
 
+# Logo + wordmark del sidebar. Los dos trazos del SVG son los cauces del
+# Limay y del Neuquén encontrandose: es la cuenca que mide la app, dibujada
+# con el mismo verde-río que el acento del tema.
+BRAND_HTML = """
+<div class="brand">
+  <svg width="26" height="26" viewBox="0 0 28 28" fill="none">
+    <path d="M4 6C4 6 10 10 10 15C10 20 4 24 4 24" stroke="#0d6e74" stroke-width="1.6" fill="none"/>
+    <path d="M24 6C24 6 18 10 18 15C18 20 24 24 24 24" stroke="#0d6e74" stroke-width="1.6" fill="none"/>
+    <path d="M10 15L18 15" stroke="#0d6e74" stroke-width="1.6"/>
+  </svg>
+  <div>
+    <div class="brand-name">Monitoreo Cuenca Neuquén</div>
+    <div class="brand-sub">Ingeniería Ambiental</div>
+  </div>
+</div>
+"""
+
+
 def render_sidebar():
     """
     Renderiza el menú lateral (Sidebar) con títulos, filtros y controles de capas.
     """
     with st.sidebar:
-        st.title("Monitoreo Cuenca Neuquén")
+        # Marca: logo de dos cauces que convergen (la confluencia
+        # Limay-Neuquén) + nombre en serif. Reemplaza al st.title, que a
+        # 2rem se comía el alto útil de una columna que después tiene que
+        # entrar cinco grupos de controles.
+        st.markdown(BRAND_HTML, unsafe_allow_html=True)
         st.markdown("---")
-        
-        st.subheader("🌦️ Filtros")
-        
+
+        st.subheader("Filtros")
+
         # Filtro requerido para Estaciones Meteorológicas
         estaciones_options = [
             "Todas las estaciones",
@@ -24,7 +46,7 @@ def render_sidebar():
         ]
         
         selected_estacion = st.selectbox(
-            label="Estaciones Meteorológicas",
+            label="Estaciones meteorológicas",
             options=estaciones_options,
             index=0,
             help="Filtre las estaciones meteorológicas desplegadas en la cuenca."
@@ -32,7 +54,7 @@ def render_sidebar():
 
         st.markdown("---")
 
-        st.subheader("🌦️ Capa Climática")
+        st.subheader("Capa climática")
         climate_layer_options = [
             "Ninguna",
             "Precipitación acumulada 2016-2026",
@@ -49,7 +71,7 @@ def render_sidebar():
 
         st.markdown("---")
 
-        st.subheader("🧊 Panel 3D")
+        st.subheader("Panel 3D")
 
         enable_climate_cross = st.checkbox(
             "Mostrar el panel 3D sin polígono dibujado",
@@ -72,14 +94,20 @@ def render_sidebar():
 
         st.markdown("---")
 
-        st.subheader("🗺️ Capas del Mapa")
-        show_cuenca = st.checkbox("Mostrar Polígonos de Cuenca", value=True)
-        show_rios = st.checkbox("Mostrar Ríos", value=True)
-        show_lagos = st.checkbox("Mostrar Lagos y Cuerpos de Agua", value=True)
-        show_stations = st.checkbox("Mostrar Estaciones Meteorológicas", value=True)
+        st.subheader("Capas del mapa")
+        show_cuenca = st.checkbox("Mostrar polígonos de cuenca", value=True)
+        show_rios = st.checkbox("Mostrar ríos", value=True)
+        show_lagos = st.checkbox("Mostrar lagos y cuerpos de agua", value=True)
+        show_stations = st.checkbox("Mostrar estaciones meteorológicas", value=True)
 
-        st.markdown("---")
-        st.info("💡 **Tip**: Seleccione un polígono en el mapa para inspeccionar sus atributos geográficos.")
+        # Nota en caja muda en vez de st.info: es una ayuda permanente, no
+        # un evento, y el azul saturado de st.info la hacía competir con los
+        # estados reales del análisis.
+        st.markdown(
+            '<div class="side-note">Seleccioná un polígono en el mapa para '
+            'inspeccionar sus atributos geográficos.</div>',
+            unsafe_allow_html=True,
+        )
 
         return {
             "selected_estacion": selected_estacion,
